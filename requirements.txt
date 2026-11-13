@@ -1,0 +1,8 @@
+# SDK MCP officiel (v2 : FastMCP s'appelle désormais MCPServer)
+mcp>=2.3,<3
+openai>=3.0
+uvicorn>=0.31
+httpx2>=2.10
+python-dotenv>=1.0
+# yt-dlp est aussi mis à jour au démarrage du conteneur (voir entrypoint.sh)
+yt-dlp[default]>=2026.10.26
