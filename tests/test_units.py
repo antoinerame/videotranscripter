@@ -125,3 +125,18 @@ def test_merge_without_segments():
     tr._price_fetched_at = 1e18
     res = asyncio.run(tr._merge([AudioChunk(None, 0.0, 10.0)], [{"text": "hello"}], "en"))
     assert not res.timestamps and res.segments == [] and res.text == "hello" and res.language == "en"
+
+
+def test_merge_cleans_whitespace():
+    tr = OpenRouterTranscriber("k", "m", base_url="http://127.0.0.1:1")
+    tr._price_per_second = 0.0
+    tr._price_fetched_at = 1e18
+    data = {"text": "a  b", "segments": [{"start": 0, "end": 1, "text": "  a  b "}]}
+    res = asyncio.run(tr._merge([AudioChunk(None, 0.0, 1.0)], [data], None))
+    assert res.text == "a b" and res.segments[0].text == "a b"
+
+
+def test_provider_routing_config():
+    tr = OpenRouterTranscriber("k", "m", provider_order=["primeintellect"], provider_ignore=["deepinfra"])
+    assert tr._provider == {"order": ["primeintellect"], "allow_fallbacks": True, "ignore": ["deepinfra"]}
+    assert OpenRouterTranscriber("k", "m")._provider == {}

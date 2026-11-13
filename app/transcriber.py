@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -69,8 +71,22 @@ class TranscriptResult:
 
 
 class OpenRouterTranscriber:
-    def __init__(self, api_key: str, model: str, base_url: str = "https://openrouter.ai/api/v1"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str = "https://openrouter.ai/api/v1",
+        provider_order: list[str] | None = None,
+        provider_ignore: list[str] | None = None,
+    ):
         self.model = model
+        # Routage OpenRouter (champ multipart `provider`, objet JSON encodé en chaîne)
+        self._provider: dict[str, Any] = {}
+        if provider_order:
+            self._provider["order"] = provider_order
+            self._provider["allow_fallbacks"] = True
+        if provider_ignore:
+            self._provider["ignore"] = provider_ignore
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._client = AsyncOpenAI(
@@ -88,18 +104,35 @@ class OpenRouterTranscriber:
     # ------------------------------------------------------------------ prix
 
     async def price_per_second(self) -> float | None:
-        """Prix du modèle (USD / seconde d'audio) lu sur l'API publique des modèles OpenRouter."""
+        """Prix estimé (USD / seconde d'audio) du fournisseur qui devrait servir la requête (API publique OpenRouter)."""
         if self._price_per_second is not None and time.time() - self._price_fetched_at < PRICING_TTL:
             return self._price_per_second
         try:
             async with httpx2.AsyncClient(timeout=10) as http:
-                resp = await http.get(f"{self.base_url}/models", params={"output_modalities": "transcription"})
+                resp = await http.get(f"{self.base_url}/models/{self.model}/endpoints")
                 resp.raise_for_status()
-            for m in resp.json().get("data", []):
-                if m.get("id") == self.model:
-                    self._price_per_second = float(m["pricing"]["prompt"])
-                    self._price_fetched_at = time.time()
+            ignored = [p.lower() for p in self._provider.get("ignore", [])]
+            prices: dict[str, float] = {}
+            for ep in resp.json().get("data", {}).get("endpoints", []):
+                tag = (ep.get("tag") or "").lower()
+                name = (ep.get("provider_name") or "").lower()
+                if any(tag == i or tag.startswith(i + "/") or name == i for i in ignored):
+                    continue
+                price = float(ep["pricing"]["prompt"])
+                prices[tag or name] = price
+                prices.setdefault(name, price)
+            # prix du premier fournisseur préféré disponible, sinon le moins cher (choix par défaut d'OpenRouter)
+            chosen = None
+            for preferred in (p.lower() for p in self._provider.get("order", [])):
+                match = [v for k, v in prices.items() if k == preferred or k.startswith(preferred + "/")]
+                if match:
+                    chosen = match[0]
                     break
+            if chosen is None and prices:
+                chosen = min(prices.values())
+            if chosen is not None:
+                self._price_per_second = chosen
+                self._price_fetched_at = time.time()
         except Exception as exc:  # le prix n'est qu'indicatif (logs)
             log.debug("Impossible de récupérer le prix du modèle : %s", exc)
         return self._price_per_second
@@ -114,6 +147,8 @@ class OpenRouterTranscriber:
         }
         if language:
             kwargs["language"] = language
+        if self._provider:
+            kwargs["extra_body"] = {"provider": json.dumps(self._provider)}
         if verbose:
             kwargs["response_format"] = "verbose_json"
             kwargs["timestamp_granularities"] = ["segment"]
@@ -174,14 +209,14 @@ class OpenRouterTranscriber:
         all_have_segments = True
 
         for chunk, data in zip(chunks, results, strict=True):
-            text = (data.get("text") or "").strip()
+            text = _clean(data.get("text") or "")
             texts.append(text)
             detected = detected or data.get("language")
 
             raw_segments = data.get("segments") or []
             if raw_segments:
                 for seg in raw_segments:
-                    seg_text = (seg.get("text") or "").strip()
+                    seg_text = _clean(seg.get("text") or "")
                     if not seg_text:
                         continue
                     segments.append(
@@ -219,6 +254,13 @@ class OpenRouterTranscriber:
 
     async def aclose(self) -> None:
         await self._client.close()
+
+
+_SPACES = re.compile(r"[ \t]{2,}")
+
+
+def _clean(text: str) -> str:
+    return _SPACES.sub(" ", text).strip()
 
 
 def _api_message(exc: openai.APIStatusError) -> str:

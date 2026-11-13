@@ -148,9 +148,12 @@ def main() -> None:
     setup_logging(settings.log_level)
     app, _, _ = create_app(settings)
     log.info(
-        "Démarrage : port %d | modèle %s | max %.0f min/vidéo | %d transcriptions/h | cookies %s",
+        "Démarrage : port %d | modèle %s (fournisseurs : ordre=%s ignorés=%s) | max %.0f min/vidéo | "
+        "%d transcriptions/h | cookies %s",
         settings.port,
         settings.transcription_model,
+        ",".join(settings.provider_order) or "auto",
+        ",".join(settings.provider_ignore) or "aucun",
         settings.max_video_minutes,
         settings.rate_limit_per_hour,
         settings.cookies_path if settings.cookies_path and settings.cookies_path.is_file() else "non",

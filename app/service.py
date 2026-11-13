@@ -37,7 +37,11 @@ class TranscriptService:
         self.cache = TranscriptCache(settings.cache_db_path)
         self.limiter = SlidingWindowRateLimiter(settings.rate_limit_per_hour, 3600)
         self.transcriber = OpenRouterTranscriber(
-            settings.openrouter_api_key, settings.transcription_model, settings.openrouter_base_url
+            settings.openrouter_api_key,
+            settings.transcription_model,
+            settings.openrouter_base_url,
+            provider_order=settings.provider_order,
+            provider_ignore=settings.provider_ignore,
         )
         self._jobs = asyncio.Semaphore(settings.max_concurrent_jobs)
         # un verrou par clé de cache : deux appels simultanés sur la même vidéo ne la transcrivent qu'une fois

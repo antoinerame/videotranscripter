@@ -60,6 +60,8 @@ class Settings:
     max_concurrent_jobs: int = 2
     log_level: str = "INFO"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    provider_order: list[str] = field(default_factory=list)
+    provider_ignore: list[str] = field(default_factory=list)
 
     @property
     def cache_db_path(self) -> Path:
@@ -76,6 +78,13 @@ class Settings:
     @property
     def max_upload_bytes(self) -> int:
         return int(self.max_upload_mb * 1024 * 1024)
+
+
+def _env_list(name: str, default: str) -> list[str]:
+    raw = _env(name, default) or ""
+    if raw.lower() in ("none", "-", "aucun"):
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def load_settings(*, require_token: bool = True) -> Settings:
@@ -120,6 +129,10 @@ def load_settings(*, require_token: bool = True) -> Settings:
         log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
         openrouter_base_url=_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         or "https://openrouter.ai/api/v1",
+        # whisper-large-v3-turbo via DeepInfra perd du texte aux frontières de ses fenêtres de 30 s
+        # (constaté en test) : on privilégie PrimeIntellect, avec repli automatique sur les autres.
+        provider_order=_env_list("TRANSCRIPTION_PROVIDER_ORDER", "primeintellect"),
+        provider_ignore=_env_list("TRANSCRIPTION_PROVIDER_IGNORE", ""),
     )
     if settings.max_video_minutes <= 0:
         raise ConfigError("MAX_VIDEO_MINUTES doit être > 0.")

@@ -66,6 +66,8 @@ Ensuite, dans une conversation : *« Résume la vidéo de ce post : https://x.co
 | `MAX_VIDEO_MINUTES` | `30` | Durée max d'une vidéo. Au-delà, refus avant tout téléchargement |
 | `RATE_LIMIT_PER_HOUR` | `30` | Transcriptions par heure glissante (les hits de cache ne comptent pas) |
 | `COOKIES_PATH` | vide | ex. `/cookies/cookies.txt` (voir plus bas) |
+| `TRANSCRIPTION_PROVIDER_ORDER` | `primeintellect` | Fournisseurs OpenRouter préférés, séparés par des virgules (repli automatique sur les autres) ; `none` = choix d'OpenRouter |
+| `TRANSCRIPTION_PROVIDER_IGNORE` | vide | Fournisseurs à exclure, ex. `deepinfra` |
 
 Variables avancées (voir `.env.example`) : `BIND_ADDRESS`, `ALLOWED_HOSTS`, `MAX_UPLOAD_MB` (24),
 `CHUNK_MAX_SECONDS` (600), `AUDIO_BITRATE` (32k), `LOG_LEVEL`, `PUID`/`PGID`, `YTDLP_AUTO_UPDATE` (1).
@@ -113,11 +115,18 @@ Tests unitaires : `pip install pytest && pytest tests`.
   recollés avec décalage des timestamps.
 - **Timestamps** : le serveur demande `response_format=verbose_json` avec
   `timestamp_granularities=["segment"]`. La doc OpenRouter précise que le support dépend du
-  fournisseur qui sert le modèle. Si `verbose_json` est refusé (HTTP 400), le serveur repasse
+  fournisseur qui sert le modèle. Vérifié avec `whisper-large-v3-turbo` : les timestamps par segment
+  sont bien renvoyés. Si `verbose_json` est refusé (HTTP 400), le serveur repasse
   automatiquement en `json` (texte brut, horodaté par morceau) et retient ce choix jusqu'au redémarrage.
+- **Choix du fournisseur** : `whisper-large-v3-turbo` est servi par DeepInfra, PrimeIntellect et Groq.
+  OpenRouter choisit le moins cher (DeepInfra) si on ne précise rien. En test sur une vidéo de 3 min en
+  français, DeepInfra **perdait des phrases à chaque frontière de 30 s** et ne renvoyait que des blocs
+  de 30 s, de façon reproductible. PrimeIntellect a donné un transcript complet avec des segments fins.
+  Le serveur demande donc PrimeIntellect en priorité, avec repli automatique sur les autres s'il est
+  indisponible. Le prix est d'environ 0,04 $/h d'audio au lieu de 0,012 $/h.
 - **Coût** : chaque transcription est loggée avec la durée facturée (`usage.seconds`), le coût estimé
-  (`usage.seconds` × prix/seconde lu sur l'API publique des modèles OpenRouter) et le coût réel
-  (`usage.cost`) quand OpenRouter le renvoie. Whisper Large V3 Turbo coûte environ 0,0002 $/min.
+  (`usage.seconds` × prix/seconde du fournisseur préféré, lu sur l'API publique OpenRouter) et le coût réel
+  (`usage.cost`) quand OpenRouter le renvoie. Whisper Large V3 Turbo via PrimeIntellect coûte environ 0,0007 $/min.
 - **Rate limit** : en mémoire, remis à zéro au redémarrage. Une requête qui échoue avant l'appel
   OpenRouter (pas de vidéo, vidéo trop longue, post introuvable…) ne consomme pas de quota.
 - **Erreurs** renvoyées à Claude en clair : URL non-X, post sans vidéo, post introuvable / privé / supprimé,
@@ -128,9 +137,9 @@ Tests unitaires : `pip install pytest && pytest tests`.
 Exemple de log :
 
 ```
-x_transcript: tweet=1724884212803834154 video=0 lang=auto -> OK | durée vidéo 5:41 | 1 morceau(x) |
-  audio facturé 342s | coût ~$0.00114 estimé / $0.00114 facturé | timestamps=True |
-  dl 12.7s + transcription 4.4s = 17.1s | quota restant 29/h
+x_transcript: tweet=2121118194198790409 video=0 lang=fr -> OK | durée vidéo 2:59 | 1 morceau(x) |
+  audio facturé 179s | coût ~$0.00199 estimé / $0.00199 facturé | timestamps=True |
+  dl 5.7s + transcription 5.0s = 10.7s | quota restant 29/h
 ```
 
 ## Structure
