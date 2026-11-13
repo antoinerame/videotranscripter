@@ -8,23 +8,23 @@ class TranscriptError(Exception):
 
 
 class InvalidUrlError(TranscriptError):
-    pass
+    """URL refusée (format, site non pris en charge, adresse réseau privée…)."""
 
 
-class NoVideoError(TranscriptError):
-    pass
+class NoMediaError(TranscriptError):
+    """La page ne contient pas de vidéo/audio exploitable."""
 
 
-class TweetUnavailableError(TranscriptError):
-    pass
+class MediaUnavailableError(TranscriptError):
+    """Contenu supprimé, privé, introuvable ou géo-bloqué."""
 
 
 class LoginRequiredError(TranscriptError):
     pass
 
 
-class XBlockedError(TranscriptError):
-    pass
+class SiteBlockedError(TranscriptError):
+    """Le site bloque/limite les requêtes du serveur (anti-bot, rate limit)."""
 
 
 class VideoTooLongError(TranscriptError):

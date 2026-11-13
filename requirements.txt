@@ -4,5 +4,6 @@ openai>=3.0
 uvicorn>=0.31
 httpx2>=2.10
 python-dotenv>=1.0
-# yt-dlp est aussi mis à jour au démarrage du conteneur (voir entrypoint.sh)
-yt-dlp[default]>=2026.10.26
+# yt-dlp est aussi mis à jour au démarrage du conteneur (voir entrypoint.sh).
+# L'extra "deno" fournit le moteur JavaScript dont yt-dlp a besoin pour YouTube.
+yt-dlp[default,deno]>=2026.10.26

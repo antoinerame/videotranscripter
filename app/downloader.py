@@ -1,7 +1,9 @@
-"""Récupération des métadonnées et de l'audio d'un post X via yt-dlp, puis conversion ffmpeg."""
+"""Métadonnées et audio d'un média (tout site pris en charge par yt-dlp), puis conversion ffmpeg."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import shutil
@@ -16,41 +18,51 @@ from yt_dlp.utils import ExtractorError
 
 from .errors import (
     DownloadError,
+    InvalidUrlError,
     LoginRequiredError,
-    NoVideoError,
-    TweetUnavailableError,
-    VideoTooLongError,
-    XBlockedError,
+    MediaUnavailableError,
+    NoMediaError,
+    SiteBlockedError,
 )
-from .xurl import TweetRef
+from .urls import MediaRef, UrlPolicy, ensure_public_host, media_key
 
 log = logging.getLogger(__name__)
 
-# yt-dlp ne peut utiliser QUE les extracteurs X/Twitter : si un post renvoie vers
-# un site externe (YouTube…), il ne sera pas suivi.
-ALLOWED_EXTRACTORS = [r"twitter", r"twitter:(amplify|broadcast|card)"]
+MAX_ITEMS = 50  # nombre max d'éléments lus dans une playlist / un flux / un post multi-vidéos
+MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 
 COOKIES_HINT = (
-    "Si le problème persiste, X bloque probablement les requêtes anonymes : exportez les cookies "
-    "d'une session X connectée (format Netscape cookies.txt) et montez-les via COOKIES_PATH."
+    "Si le problème persiste, exportez les cookies d'un navigateur connecté à ce site (format Netscape "
+    "cookies.txt) dans le fichier indiqué par COOKIES_PATH ; un même fichier peut contenir les cookies de "
+    "plusieurs sites."
 )
+
+# Formats « playlist » qui feraient lire d'autres fichiers/URLs à ffmpeg : jamais attendus ici.
+_FORBIDDEN_FFMPEG_FORMATS = {"hls", "applehttp", "concat", "m3u", "m3u8", "dash", "ffconcat"}
+
+
+_FEED_FIELDS = ("title", "description", "timestamp", "upload_date", "release_timestamp", "duration", "id")
 
 
 @dataclass
-class VideoInfo:
-    tweet_id: str
+class MediaInfo:
+    key: str  # clé de cache définitive (plateforme:id)
+    platform: str  # extractor_key yt-dlp
     url: str
-    author_name: str | None
-    author_handle: str | None
+    title: str | None
+    author: str | None
+    author_id: str | None
     timestamp: float | None
-    text: str | None
+    upload_date: str | None
+    description: str | None
     like_count: int | None
     repost_count: int | None
     comment_count: int | None
     view_count: int | None
     duration: float | None
-    video_count: int
-    video_index: int
+    item_index: int
+    item_count: int
+    playlist_title: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,25 +95,28 @@ class _QuietLogger:
         log.info("yt-dlp error: %s", msg)
 
 
-def _ydl_opts(workdir: Path, cookies_path: Path | None) -> dict[str, Any]:
+def _ydl_opts(workdir: Path, cookies_path: Path | None, policy: UrlPolicy) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": False,
         "noprogress": True,
         "logger": _QuietLogger(),
-        "allowed_extractors": ALLOWED_EXTRACTORS,
-        # piste audio seule si disponible, sinon le plus petit MP4 (qui contient l'audio)
+        "allowed_extractors": policy.allowed_extractors,
+        # piste audio seule si disponible, sinon le plus petit format vidéo+audio
         "format": "bestaudio/worst",
         "outtmpl": str(workdir / "source.%(ext)s"),
-        "noplaylist": False,
+        # watch?v=X&list=Y -> la vidéo X, pas la playlist
+        "noplaylist": True,
+        # playlists / flux RSS : on liste les éléments sans les résoudre tous
+        "extract_flat": "in_playlist",
+        "playlist_items": f"1:{MAX_ITEMS}",
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
         "overwrites": True,
         "cachedir": False,
-        "max_filesize": 1024 * 1024 * 1024,
-        # renvoie les métadonnées même sans vidéo : permet de distinguer
-        # « post sans vidéo » de « post introuvable »
+        "max_filesize": MAX_DOWNLOAD_BYTES,
+        # renvoie les métadonnées même sans média : distingue « pas de vidéo » de « introuvable »
         "ignore_no_formats_error": True,
     }
     if cookies_path:
@@ -111,65 +126,62 @@ def _ydl_opts(workdir: Path, cookies_path: Path | None) -> dict[str, Any]:
             # yt-dlp réécrit le fichier cookies en sortie : on travaille sur une copie
             # (le volume peut être monté en lecture seule).
             copy = workdir / "cookies.txt"
-            shutil.copyfile(cookies_path, copy)
+            if not copy.exists():
+                shutil.copyfile(cookies_path, copy)
             opts["cookiefile"] = str(copy)
     return opts
 
 
-def _map_ytdlp_error(exc: Exception, has_cookies: bool) -> Exception:
-    msg = str(exc)
+def _h(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def _has(low: str, *needles: str) -> bool:
+    return any(n in low for n in needles)
+
+
+def _map_ytdlp_error(exc: Exception, has_cookies: bool, site: str) -> Exception:
+    msg = str(exc).removeprefix("ERROR: ")
     low = msg.lower()
-    log.info("yt-dlp a échoué : %s", msg)
-    if "no video could be found" in low or "is not a video" in low or "no video formats" in low:
-        return NoVideoError("Ce post ne contient pas de vidéo (ou uniquement des images / du texte).")
-    if "unsupported url" in low or "extractors are restricted" in low or "not supported because" in low:
-        return NoVideoError(
-            "Ce post ne contient pas de vidéo native X (il pointe peut-être vers un site externe, "
-            "qui n'est pas pris en charge par ce serveur)."
-        )
-    if "protected tweet" in low or "not authorized to view" in low:
-        return LoginRequiredError(
-            "Ce post vient d'un compte protégé (privé) : il n'est pas accessible."
-            + ("" if has_cookies else " Avec des cookies d'un compte qui suit ce compte, cela pourrait fonctionner.")
-        )
-    if "nsfw" in low or "requires authentication" in low or "login" in low or "log in" in low:
-        return LoginRequiredError(
-            "X exige d'être connecté pour voir ce post (contenu sensible ou restreint). "
-            + ("Les cookies configurés semblent invalides ou expirés : ré-exportez-les." if has_cookies else COOKIES_HINT)
-        )
-    if (
-        "tweet is unavailable" in low
-        or "requested tweet is unavailable" in low
-        or "twitter api says" in low
-        or "suspended" in low
-        or "deleted" in low
-        or "http error 404" in low
-        or "does not exist" in low
-    ):
-        return TweetUnavailableError(
-            "Post introuvable : il a été supprimé, son compte est suspendu/privé, ou l'URL est erronée."
-            f" (détail X : {msg.split(':')[-1].strip()[:200]})"
-        )
-    if (
-        "429" in low
-        or "rate-limit" in low
-        or "rate limit" in low
-        or "guest token" in low
-        or "http error 403" in low
-        or "forbidden" in low
-        or "bad guest" in low
-    ):
-        return XBlockedError(
-            "X bloque ou limite les requêtes de ce serveur (rate limit / jeton invité refusé). "
-            + ("Réessayez plus tard ; si cela continue, ré-exportez les cookies." if has_cookies else COOKIES_HINT)
-        )
-    return DownloadError(f"Échec de la récupération de la vidéo via yt-dlp : {msg[:500]}. {COOKIES_HINT}")
+    log.info("yt-dlp a échoué (%s) : %s", site, msg)
+    cookies_bad = "Les cookies configurés sont peut-être expirés : ré-exportez-les." if has_cookies else COOKIES_HINT
 
-
-def _entries(info: dict[str, Any]) -> list[dict[str, Any]]:
-    if info.get("_type") in ("playlist", "multi_video"):
-        return [e for e in (info.get("entries") or []) if e]
-    return [info]
+    if "unsupported url" in low:
+        return InvalidUrlError(f"Site ou type de lien non pris en charge par yt-dlp : {msg[:200]}")
+    if _has(low, "drm"):
+        return NoMediaError(f"Ce contenu ({site}) est protégé par DRM : impossible de récupérer l'audio.")
+    if _has(low, "not a bot"):
+        return SiteBlockedError(f"{site} bloque ce serveur (vérification anti-bot). {cookies_bad}")
+    if _has(low, "private video", "video is private", "protected tweet", "not authorized to view", "is private"):
+        return LoginRequiredError(
+            f"Ce contenu {site} est privé : il n'est pas accessible."
+            + ("" if has_cookies else " Avec les cookies d'un compte autorisé à le voir, cela pourrait fonctionner.")
+        )
+    if _has(low, "confirm your age", "age-restricted", "age restricted", "nsfw", "inappropriate"):
+        return LoginRequiredError(
+            f"{site} exige d'être connecté pour ce contenu (restriction d'âge / contenu sensible). {cookies_bad}"
+        )
+    if _has(low, "geo restrict", "geo-restrict", "not available in your country", "not available from your location"):
+        return MediaUnavailableError(f"Ce contenu {site} n'est pas disponible depuis le pays du serveur (géo-blocage).")
+    if _has(
+        low, "no video could be found", "no video formats", "is not a video", "no media found",
+        "there is no video", "no formats found",
+    ):  # fmt: skip
+        return NoMediaError(f"Aucune vidéo ni piste audio trouvée sur cette page ({site}).")
+    if _has(low, "live event will begin", "premieres in", "not started yet"):
+        return NoMediaError("Ce direct / cette première n'a pas encore commencé : rien à transcrire.")
+    if _has(
+        low, "unavailable", "removed", "deleted", "does not exist", "not found", "http error 404",
+        "suspended", "no longer available", "twitter api says", "terminated",
+    ):  # fmt: skip
+        return MediaUnavailableError(
+            f"Contenu introuvable sur {site} : supprimé, privé, ou URL erronée. (détail : {msg[:200]})"
+        )
+    if _has(low, "login", "log in", "logged-in", "logged in", "sign in", "authentication", "cookies"):
+        return LoginRequiredError(f"{site} exige d'être connecté pour accéder à ce contenu. {cookies_bad}")
+    if _has(low, "429", "rate-limit", "rate limit", "too many requests", "guest token", "http error 403", "forbidden"):
+        return SiteBlockedError(f"{site} bloque ou limite les requêtes de ce serveur. {cookies_bad}")
+    return DownloadError(f"Échec de la récupération du média via yt-dlp ({site}) : {msg[:400]}. {COOKIES_HINT}")
 
 
 def _int(v: Any) -> int | None:
@@ -179,82 +191,145 @@ def _int(v: Any) -> int | None:
         return None
 
 
-def _video_info(ref: TweetRef, root: dict[str, Any], entry: dict[str, Any], count: int, index: int) -> VideoInfo:
+def _has_media(entry: dict[str, Any]) -> bool:
+    if entry.get("formats"):
+        return True
+    return bool(entry.get("url")) and entry.get("_type") not in ("url", "url_transparent")
+
+
+def _exists(entry: dict[str, Any]) -> bool:
+    """Heuristique : une page qui existe a au moins un auteur ou un titre non vide."""
+    return bool(entry.get("uploader") or entry.get("uploader_id") or entry.get("channel") or entry.get("title"))
+
+
+def _media_info(ref: MediaRef, root: dict[str, Any], entry: dict[str, Any], count: int, index: int) -> MediaInfo:
+    in_playlist = root is not entry
+
     def pick(key: str) -> Any:
         value = entry.get(key)
-        return value if value is not None else root.get(key)
+        return root.get(key) if value is None and in_playlist else value
 
-    handle = pick("uploader_id") or ref.handle
-    return VideoInfo(
-        tweet_id=ref.tweet_id,
-        url=f"https://x.com/{handle or 'i'}/status/{ref.tweet_id}",
-        author_name=pick("uploader"),
-        author_handle=handle,
-        timestamp=pick("timestamp"),
-        text=pick("description"),
+    # sur X, la « playlist » d'un post multi-vidéos n'apporte rien de plus que le post
+    playlist_title = root.get("title") if in_playlist and root.get("extractor_key") != "Twitter" else None
+    return MediaInfo(
+        key=media_key(entry),
+        platform=entry.get("extractor_key") or ref.extractor,
+        url=entry.get("webpage_url") or root.get("webpage_url") or ref.url,
+        title=entry.get("title"),
+        author=pick("uploader") or pick("channel") or pick("creator"),
+        author_id=pick("uploader_id") or pick("channel_id"),
+        timestamp=entry.get("timestamp") or entry.get("release_timestamp"),
+        upload_date=entry.get("upload_date") or entry.get("release_date"),
+        description=pick("description"),
         like_count=_int(pick("like_count")),
         repost_count=_int(pick("repost_count")),
         comment_count=_int(pick("comment_count")),
         view_count=_int(pick("view_count")),
         duration=entry.get("duration"),
-        video_count=count,
-        video_index=index,
+        item_index=index,
+        item_count=count,
+        playlist_title=playlist_title,
     )
 
 
-def fetch_audio(
-    ref: TweetRef,
-    video_index: int,
-    workdir: Path,
-    cookies_path: Path | None,
-    max_duration: float,
-) -> tuple[VideoInfo, Path]:
-    """Récupère les métadonnées, vérifie la durée, puis télécharge l'audio. Bloquant (à lancer dans un thread)."""
-    opts = _ydl_opts(workdir, cookies_path)
+def resolve_media(
+    ref: MediaRef, index: int, workdir: Path, cookies_path: Path | None, policy: UrlPolicy
+) -> tuple[MediaInfo, dict[str, Any]]:
+    """Récupère les métadonnées du média visé (sans le télécharger). Bloquant."""
+    opts = _ydl_opts(workdir, cookies_path, policy)
     has_cookies = "cookiefile" in opts
+    site = ref.extractor
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(ref.canonical_url, download=False)
+            info = ydl.extract_info(ref.url, download=False)
             if not info:
-                raise NoVideoError("Ce post ne contient pas de vidéo.")
-            all_entries = _entries(info)
-            entries = [e for e in all_entries if e.get("formats") or e.get("url")]
-            if not entries:
-                if not any(e.get("uploader") or e.get("uploader_id") for e in [info, *all_entries]):
-                    raise TweetUnavailableError(
-                        "Post introuvable : il a été supprimé, il est privé (compte protégé), l'URL est erronée, "
-                        "ou X refuse l'accès anonyme à ce post. "
-                        + ("Les cookies configurés sont peut-être expirés." if has_cookies else COOKIES_HINT)
-                    )
-                raise NoVideoError("Ce post ne contient pas de vidéo (ou uniquement des images / du texte).")
-            if video_index >= len(entries):
-                raise NoVideoError(
-                    f"video_index={video_index} hors limites : ce post contient {len(entries)} vidéo(s) "
+                raise NoMediaError("Aucun média trouvé à cette adresse.")
+            site = info.get("extractor_key") or site
+
+            if info.get("_type") in ("playlist", "multi_video"):
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    raise NoMediaError(f"Cette page ({site}) ne contient aucune vidéo ni piste audio.")
+            else:
+                entries = [info]
+
+            if index >= len(entries):
+                more = " au moins" if len(entries) >= MAX_ITEMS else ""
+                raise NoMediaError(
+                    f"video_index={index} hors limites : cette URL contient{more} {len(entries)} élément(s) "
                     f"(indices valides : 0 à {len(entries) - 1})."
                 )
-            entry = entries[video_index]
-            meta = _video_info(ref, info, entry, len(entries), video_index)
+            entry = entries[index]
+            meta_entry = entry
+            key = None
 
-            if meta.duration and meta.duration > max_duration:
-                raise VideoTooLongError(
-                    f"Vidéo trop longue : {format_duration(meta.duration)} "
-                    f"(maximum autorisé : {format_duration(max_duration)}, réglable via MAX_VIDEO_MINUTES)."
+            # élément de playlist / flux non encore résolu : on le résout, avec les mêmes garde-fous
+            if entry.get("_type") in ("url", "url_transparent"):
+                flat = entry
+                target = entry.get("url") or ""
+                policy.check(target)
+                ensure_public_host(target)
+                resolved = ydl.extract_info(target, download=False, ie_key=entry.get("ie_key"))
+                if not resolved or resolved.get("_type") in ("playlist", "multi_video"):
+                    raise NoMediaError("L'élément choisi est lui-même une playlist : donnez le lien direct de la vidéo.")
+                entry = meta_entry = resolved
+                if resolved.get("extractor_key") == "Generic":
+                    # épisode de flux RSS : le flux connaît le vrai titre / la date, pas le fichier mp3
+                    meta_entry = {**resolved, **{k: flat[k] for k in _FEED_FIELDS if flat.get(k)}}
+                    # l'URL du mp3 contient souvent des jetons qui changent : clé = flux + GUID de l'épisode
+                    feed = info.get("webpage_url") or ref.url
+                    episode = str(flat.get("id") or target)
+                    key = f"Feed:{_h(feed)}:{_h(episode)}"
+
+            if not _has_media(entry):
+                if not _exists(entry) and not _exists(info):
+                    raise MediaUnavailableError(
+                        f"Contenu introuvable sur {site} : supprimé, privé, URL erronée, ou le site refuse l'accès "
+                        "anonyme. " + ("Les cookies configurés sont peut-être expirés." if has_cookies else COOKIES_HINT)
+                    )
+                raise NoMediaError(
+                    f"Cette page ({site}) ne contient pas de vidéo ni d'audio (ou uniquement du texte / des images)."
                 )
 
+            if entry.get("is_live") or entry.get("live_status") == "is_live":
+                raise NoMediaError("C'est un direct en cours : seules les vidéos terminées peuvent être transcrites.")
+            if entry.get("live_status") == "is_upcoming":
+                raise NoMediaError("Ce direct / cette première n'a pas encore commencé : rien à transcrire.")
+
+            count = len(entries)
+            if count >= MAX_ITEMS and (info.get("playlist_count") or 0) > count:
+                count = int(info["playlist_count"])
+            media = _media_info(ref, info, meta_entry, count, index)
+            if key:
+                media.key = key
+            return media, entry
+    except (YtDlpDownloadError, ExtractorError) as exc:
+        raise _map_ytdlp_error(exc, has_cookies, site) from exc
+
+
+def download_audio(
+    ref: MediaRef, entry: dict[str, Any], workdir: Path, cookies_path: Path | None, policy: UrlPolicy
+) -> Path:
+    """Télécharge l'audio (ou le plus petit format vidéo) du média déjà résolu. Bloquant."""
+    opts = _ydl_opts(workdir, cookies_path, policy)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.process_ie_result(entry, download=True)
     except (YtDlpDownloadError, ExtractorError) as exc:
-        raise _map_ytdlp_error(exc, has_cookies) from exc
+        raise _map_ytdlp_error(exc, "cookiefile" in opts, entry.get("extractor_key") or ref.extractor) from exc
 
-    sources = [p for p in workdir.glob("source.*") if p.suffix not in (".part", ".ytdl") and p.is_file()]
+    sources = [p for p in workdir.glob("source.*") if p.is_file() and p.suffix not in (".part", ".ytdl")]
     if not sources:
-        raise DownloadError("yt-dlp n'a produit aucun fichier audio/vidéo.")
-    return meta, max(sources, key=lambda p: p.stat().st_size)
+        raise DownloadError(
+            "yt-dlp n'a produit aucun fichier audio/vidéo (fichier trop volumineux ou téléchargement interrompu)."
+        )
+    return max(sources, key=lambda p: p.stat().st_size)
 
 
 # --------------------------------------------------------------------------- ffmpeg
 
 
-def _run(cmd: list[str], timeout: float = 600) -> subprocess.CompletedProcess[str]:
+def _run(cmd: list[str], timeout: float = 900) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
 
 
@@ -266,22 +341,35 @@ def probe_duration(path: Path) -> float | None:
         return None
 
 
-def has_audio_stream(path: Path) -> bool:
+def _probe_source(path: Path) -> tuple[str, bool]:
+    """(format détecté, présence d'une piste audio). ffprobe limité aux fichiers locaux."""
     res = _run(
-        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        [
+            "ffprobe", "-v", "error", "-protocol_whitelist", "file",
+            "-show_entries", "format=format_name:stream=codec_type", "-of", "json", str(path),
+        ],
         60,
-    )
-    return res.returncode == 0 and bool(res.stdout.strip())
+    )  # fmt: skip
+    try:
+        data = json.loads(res.stdout or "{}")
+    except ValueError:
+        data = {}
+    fmt = (data.get("format") or {}).get("format_name") or ""
+    has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams") or [])
+    return fmt, has_audio
 
 
 def to_compact_mp3(src: Path, dst: Path, bitrate: str) -> None:
     """Convertit en MP3 mono 16 kHz bas débit (suffisant pour la reconnaissance vocale)."""
-    if not has_audio_stream(src):
-        raise NoVideoError("La vidéo de ce post n'a pas de piste audio (GIF ou vidéo muette) : rien à transcrire.")
+    fmt, has_audio = _probe_source(src)
+    if set(fmt.split(",")) & _FORBIDDEN_FFMPEG_FORMATS:
+        raise DownloadError(f"Format de fichier inattendu ({fmt}) : conversion refusée.")
+    if not has_audio:
+        raise NoMediaError("Ce média n'a pas de piste audio (GIF ou vidéo muette) : rien à transcrire.")
     res = _run(
         [
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(src),
+            "-protocol_whitelist", "file", "-i", str(src),
             "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", bitrate,
             str(dst),
         ]

@@ -55,13 +55,15 @@ class Settings:
     data_dir: Path = Path("/data")
     allowed_hosts: list[str] = field(default_factory=list)
     max_upload_mb: float = 24.0
-    chunk_max_seconds: int = 600
+    chunk_max_seconds: int = 300
     audio_bitrate: str = "32k"
     max_concurrent_jobs: int = 2
     log_level: str = "INFO"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     provider_order: list[str] = field(default_factory=list)
     provider_ignore: list[str] = field(default_factory=list)
+    allowed_sites: list[str] = field(default_factory=list)  # vide = tous les sites connus de yt-dlp
+    allow_generic: bool = True  # liens directs (mp3, mp4), flux RSS, pages avec vidéo intégrée
 
     @property
     def cache_db_path(self) -> Path:
@@ -78,6 +80,17 @@ class Settings:
     @property
     def max_upload_bytes(self) -> int:
         return int(self.max_upload_mb * 1024 * 1024)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return default
+    if raw.lower() in ("1", "true", "yes", "oui", "on"):
+        return True
+    if raw.lower() in ("0", "false", "no", "non", "off"):
+        return False
+    raise ConfigError(f"{name} doit valoir true ou false (reçu : {raw!r})")
 
 
 def _env_list(name: str, default: str) -> list[str]:
@@ -123,7 +136,7 @@ def load_settings(*, require_token: bool = True) -> Settings:
         data_dir=Path(_env("DATA_DIR", "/data") or "/data"),
         allowed_hosts=allowed_hosts,
         max_upload_mb=min(_env_float("MAX_UPLOAD_MB", 24.0), 25.0),
-        chunk_max_seconds=max(60, _env_int("CHUNK_MAX_SECONDS", 600)),
+        chunk_max_seconds=max(60, _env_int("CHUNK_MAX_SECONDS", 300)),
         audio_bitrate=_env("AUDIO_BITRATE", "32k") or "32k",
         max_concurrent_jobs=max(1, _env_int("MAX_CONCURRENT_JOBS", 2)),
         log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
@@ -133,6 +146,8 @@ def load_settings(*, require_token: bool = True) -> Settings:
         # (constaté en test) : on privilégie PrimeIntellect, avec repli automatique sur les autres.
         provider_order=_env_list("TRANSCRIPTION_PROVIDER_ORDER", "primeintellect"),
         provider_ignore=_env_list("TRANSCRIPTION_PROVIDER_IGNORE", ""),
+        allowed_sites=_env_list("ALLOWED_SITES", ""),
+        allow_generic=_env_bool("ALLOW_GENERIC", True),
     )
     if settings.max_video_minutes <= 0:
         raise ConfigError("MAX_VIDEO_MINUTES doit être > 0.")

@@ -7,53 +7,119 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from app.auth import TokenAuthMiddleware
+from app.cache import TranscriptCache
 from app.downloader import AudioChunk
 from app.errors import InvalidUrlError
 from app.ratelimit import SlidingWindowRateLimiter
 from app.transcriber import OpenRouterTranscriber
-from app.xurl import parse_tweet_url
+from app.urls import UrlPolicy, ensure_public_host, media_key
 
 TOKEN = "t" * 40
 
 
+@pytest.fixture(scope="module")
+def policy():
+    return UrlPolicy()
+
+
 @pytest.mark.parametrize(
-    "url,tweet_id,media",
+    "url,extractor,media_id,hint",
     [
-        ("https://x.com/jack/status/20", "20", None),
-        ("https://twitter.com/jack/status/20?s=46&t=abc", "20", None),
-        ("x.com/jack/status/20", "20", None),
-        ("https://mobile.twitter.com/jack/status/20/", "20", None),
-        ("https://x.com/i/status/20", "20", None),
-        ("https://x.com/i/web/status/20", "20", None),
-        ("https://x.com/jack/status/20/video/2", "20", 2),
-        ("https://www.x.com/jack/status/20/photo/1", "20", None),
+        ("https://x.com/jack/status/20", "Twitter", "20", None),
+        ("https://twitter.com/jack/status/20?s=46&t=abc", "Twitter", "20", None),
+        ("x.com/jack/status/20", "Twitter", "20", None),
+        ("https://x.com/jack/status/20/video/2", "Twitter", "20", 1),
+        ("https://www.youtube.com/watch?v=jNQXAC9IVRw&t=30", "Youtube", "jNQXAC9IVRw", None),
+        ("https://youtu.be/jNQXAC9IVRw?si=xyz", "Youtube", "jNQXAC9IVRw", None),
+        ("https://www.youtube.com/shorts/jNQXAC9IVRw", "Youtube", "jNQXAC9IVRw", None),
+        ("https://www.tiktok.com/@scout2015/video/6718335390845095173", "TikTok", "6718335390845095173", None),
+        ("https://example.com/podcast/episode.mp3", "Generic", None, None),
     ],
 )
-def test_parse_valid(url, tweet_id, media):
-    ref = parse_tweet_url(url)
-    assert ref.tweet_id == tweet_id
-    assert ref.media_number == media
-    assert ref.canonical_url == f"https://x.com/i/status/{tweet_id}"
+def test_policy_valid(policy, url, extractor, media_id, hint):
+    ref = policy.check(url)
+    assert (ref.extractor, ref.media_id, ref.index_hint) == (extractor, media_id, hint)
+    assert ref.request_key == (f"{extractor}:{media_id}" if media_id else None)
+    assert "#" not in ref.url
+    if extractor == "Twitter":
+        assert "/video/" not in ref.url
 
 
 @pytest.mark.parametrize(
     "url",
     [
         "",
-        "https://youtube.com/watch?v=x",
-        "https://x.com.evil.com/jack/status/20",
-        "https://evilx.com/jack/status/20",
-        "https://user:pw@x.com/jack/status/20",
-        "https://x.com:8080/jack/status/20",
         "file:///etc/passwd",
-        "https://x.com/jack",
-        "https://x.com/jack/status/abc",
-        "https://api.x.com/jack/status/20",
+        "ftp://example.com/a.mp3",
+        "https://user:pw@youtube.com/watch?v=jNQXAC9IVRw",
+        "https://youtube.com:8080/watch?v=jNQXAC9IVRw",
+        "http://192.168.1.1/video.mp4",
+        "http://127.0.0.1/a.mp3",
+        "http://[::1]/a.mp3",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://localhost/a.mp3",
     ],
 )
-def test_parse_invalid(url):
+def test_policy_invalid(policy, url):
     with pytest.raises(InvalidUrlError):
-        parse_tweet_url(url)
+        policy.check(url)
+
+
+def test_policy_restricted_sites():
+    p = UrlPolicy(["youtube", "twitter"], allow_generic=False)
+    assert p.check("https://youtu.be/jNQXAC9IVRw").extractor == "Youtube"
+    assert p.check("https://x.com/jack/status/20").extractor == "Twitter"
+    with pytest.raises(InvalidUrlError):
+        p.check("https://www.tiktok.com/@scout2015/video/6718335390845095173")
+    with pytest.raises(InvalidUrlError):
+        p.check("https://example.com/a.mp3")
+
+
+def test_no_generic():
+    p = UrlPolicy(allow_generic=False)
+    with pytest.raises(InvalidUrlError):
+        p.check("https://example.com/a.mp3")
+
+
+def test_ensure_public_host(monkeypatch):
+    import socket
+
+    def fake(host, *a, **k):
+        return [(0, 0, 0, "", ("10.0.0.5" if host == "evil.example" else "93.184.216.34", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+    ensure_public_host("https://ok.example/a.mp3")
+    with pytest.raises(InvalidUrlError):
+        ensure_public_host("https://evil.example/a.mp3")
+
+
+def test_media_key():
+    assert media_key({"extractor_key": "Youtube", "id": "abc"}) == "Youtube:abc"
+    a = media_key({"extractor_key": "Generic", "id": "episode", "webpage_url": "https://a.example/episode.mp3"})
+    b = media_key({"extractor_key": "Generic", "id": "episode", "webpage_url": "https://b.example/episode.mp3"})
+    assert a != b and a.startswith("Generic:episode-")
+
+
+def test_cache_migration_and_alias(tmp_path):
+    import json
+    import sqlite3
+
+    db = tmp_path / "c.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE transcripts (tweet_id TEXT, video_index INTEGER, language TEXT, created_at INTEGER, "
+        "model TEXT, payload TEXT, PRIMARY KEY (tweet_id, video_index, language))"
+    )
+    payload = {"meta": {"tweet_id": "20", "author_name": "jack", "text": "hi"}, "transcript": {"text": "x"}}
+    conn.execute("INSERT INTO transcripts VALUES ('20', 0, 'auto', 1, 'm', ?)", (json.dumps(payload),))
+    conn.commit()
+    conn.close()
+    cache = TranscriptCache(db)
+    got = cache.get("Twitter:20", None)
+    assert got["meta"]["platform"] == "Twitter" and got["meta"]["author"] == "jack"
+    cache.put(["Youtube:a", "Youtube:a", "Youtube:b"], "fr", "m", {"meta": {}, "transcript": {"language": "fr"}})
+    assert cache.get("Youtube:b", "fr") and cache.get("Youtube:a", None) is None
+    cache.close()
 
 
 def test_rate_limiter():

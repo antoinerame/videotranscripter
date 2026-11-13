@@ -19,7 +19,7 @@ from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-log = logging.getLogger("x_transcript.http")
+log = logging.getLogger("video_transcript.http")
 
 
 def _digest(value: str | bytes) -> bytes:

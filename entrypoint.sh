@@ -8,14 +8,14 @@ if [ "$(id -u)" = "0" ]; then
     if [ -n "${PUID:-}" ] && [ "$PUID" != "$(id -u app)" ]; then usermod -o -u "$PUID" app; fi
 fi
 
-# X modifie souvent son API : on garde yt-dlp à jour à chaque démarrage (désactivable).
+# Les sites (X, YouTube, Instagram…) changent souvent : on garde yt-dlp à jour à chaque démarrage (désactivable).
 if [ "${YTDLP_AUTO_UPDATE:-1}" = "1" ]; then
     echo "Mise à jour de yt-dlp..."
-    if ! timeout 180 pip install --no-cache-dir --upgrade --quiet --disable-pip-version-check "yt-dlp[default]"; then
+    if ! timeout 180 pip install --no-cache-dir --upgrade --quiet --disable-pip-version-check "yt-dlp[default,deno]"; then
         echo "Avertissement : mise à jour de yt-dlp impossible, la version installée est conservée."
     fi
 fi
-echo "yt-dlp $(yt-dlp --version) | $(ffmpeg -version | head -n1)"
+echo "yt-dlp $(yt-dlp --version) | deno $(deno --version 2>/dev/null | head -n1 | cut -d" " -f2) | $(ffmpeg -version | head -n1)"
 
 DATA_DIR="${DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR/tmp"

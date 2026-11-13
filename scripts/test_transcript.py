@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Appelle l'outil get_x_transcript sur une URL de post X.
+"""Appelle l'outil get_video_transcript sur une URL (YouTube, X, podcast…).
 
 Deux modes :
 
   1. En local, dans ce processus (pas besoin de lancer le serveur) :
-         python scripts/test_transcript.py https://x.com/compte/status/123
+         python scripts/test_transcript.py https://www.youtube.com/watch?v=xxxxxxxxxxx
 
   2. Contre un serveur MCP qui tourne (teste aussi le transport HTTP et l'auth) :
-         python scripts/test_transcript.py https://x.com/compte/status/123 --server http://localhost:8000
+         python scripts/test_transcript.py https://www.youtube.com/watch?v=xxxxxxxxxxx --server http://localhost:8000
      Le token est lu dans MCP_AUTH_TOKEN (.env) et envoyé dans le chemin (/mcp/<token>),
      ou en header Authorization si --bearer est passé.
 
@@ -86,7 +86,7 @@ async def run(args: argparse.Namespace) -> int:
 
     t0 = time.monotonic()
     async with Client(target, read_timeout_seconds=900) as client:
-        result = await client.call_tool("get_x_transcript", arguments, progress_callback=on_progress)
+        result = await client.call_tool("get_video_transcript", arguments, progress_callback=on_progress)
     elapsed = time.monotonic() - t0
 
     for block in result.content:
@@ -97,9 +97,9 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Teste l'outil MCP get_x_transcript sur une URL de post X.")
-    parser.add_argument("url", help="URL du post x.com / twitter.com")
-    parser.add_argument("--video-index", type=int, default=0, help="index de la vidéo dans le post (défaut 0)")
+    parser = argparse.ArgumentParser(description="Teste l'outil MCP get_video_transcript sur une URL (YouTube, X, podcast…).")
+    parser.add_argument("url", help="URL de la vidéo, du post ou de l'épisode")
+    parser.add_argument("--video-index", type=int, default=0, help="index de l'élément (post multi-vidéos, playlist, flux RSS ; défaut 0)")
     parser.add_argument("--language", help="code langue ISO-639-1 (défaut : détection auto)")
     parser.add_argument("--server", help="URL de base d'un serveur en cours d'exécution, ex. http://localhost:8000")
     parser.add_argument("--token", help="token MCP (défaut : MCP_AUTH_TOKEN)")

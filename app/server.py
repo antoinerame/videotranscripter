@@ -1,4 +1,4 @@
-"""Serveur MCP distant (streamable HTTP) exposant l'outil get_x_transcript."""
+"""Serveur MCP distant (streamable HTTP) exposant l'outil get_video_transcript."""
 
 from __future__ import annotations
 
@@ -18,34 +18,40 @@ from .config import ConfigError, Settings, load_settings
 from .errors import TranscriptError
 from .service import TranscriptService
 
-log = logging.getLogger("x_transcript")
+log = logging.getLogger("video_transcript")
 
 INSTRUCTIONS = (
-    "Ce serveur récupère le transcript (texte parlé) des vidéos publiées dans des posts X/Twitter. "
-    "Appelez get_x_transcript avec le lien du post. Les résultats sont mis en cache : rappeler l'outil "
-    "sur le même post est gratuit et instantané."
+    "Ce serveur récupère le transcript (texte parlé) de vidéos et d'audios en ligne : YouTube, X/Twitter, "
+    "Instagram, TikTok, LinkedIn, Facebook, Vimeo, SoundCloud, podcasts (Apple Podcasts, flux RSS, lien mp3 "
+    "direct) et la plupart des sites pris en charge par yt-dlp. Appelez get_video_transcript avec le lien. "
+    "Les résultats sont mis en cache : rappeler l'outil sur le même lien est gratuit et instantané."
 )
 
-TOOL_DESCRIPTION = """Récupère le transcript de la vidéo d'un post X (x.com / twitter.com).
+TOOL_DESCRIPTION = """Récupère le transcript (texte parlé) d'une vidéo ou d'un audio en ligne à partir de son URL.
 
-Renvoie un texte structuré : auteur (nom + @handle), date, texte du post, likes/reposts,
-durée de la vidéo, langue détectée, puis le transcript (horodaté par segment [mm:ss]
-quand le modèle le permet).
+Sites pris en charge : YouTube (vidéos, shorts), X/Twitter, Instagram, TikTok, LinkedIn,
+Facebook, Vimeo, Dailymotion, Twitch (rediffusions), SoundCloud, Apple Podcasts, flux RSS
+de podcast, liens directs vers un fichier audio/vidéo, et la plupart des sites gérés par yt-dlp.
 
-À utiliser quand l'utilisateur partage un lien de post X contenant une vidéo et veut
-savoir ce qui s'y dit (résumé, citation, vérification…). Seules les URLs x.com /
-twitter.com sont acceptées. Durée de vidéo limitée (30 min par défaut)."""
+Renvoie un texte structuré : plateforme, titre, auteur/chaîne, date, description ou texte
+du post, engagement (likes, vues…), durée, langue détectée, puis le transcript horodaté
+par segment [mm:ss] quand le modèle le permet.
+
+À utiliser quand l'utilisateur partage un lien de vidéo, de post ou d'épisode de podcast
+et veut savoir ce qui s'y dit (résumé, citations, vérification…). Les directs en cours
+ne sont pas pris en charge, et la durée est plafonnée (30 min par défaut). Certains sites
+(Instagram, LinkedIn, contenus restreints) peuvent exiger que le serveur ait des cookies."""
 
 
 def build_server(service: TranscriptService) -> MCPServer:
-    mcp = MCPServer("x-video-transcript", instructions=INSTRUCTIONS, version="1.0.0")
+    mcp = MCPServer("video-transcript", instructions=INSTRUCTIONS, version="2.0.0")
 
     @mcp.tool(
-        name="get_x_transcript",
-        title="Transcript d'une vidéo X/Twitter",
+        name="get_video_transcript",
+        title="Transcript d'une vidéo ou d'un audio",
         description=TOOL_DESCRIPTION,
         annotations=ToolAnnotations(
-            title="Transcript d'une vidéo X/Twitter",
+            title="Transcript d'une vidéo ou d'un audio",
             readOnlyHint=True,
             destructiveHint=False,
             idempotentHint=True,
@@ -53,19 +59,28 @@ def build_server(service: TranscriptService) -> MCPServer:
         ),
         structured_output=False,
     )
-    async def get_x_transcript(
+    async def get_video_transcript(
         url: Annotated[
-            str, Field(description="Lien d'un post X, ex. https://x.com/compte/status/1234567890123456789")
+            str,
+            Field(
+                description="Lien de la vidéo, du post ou de l'épisode : YouTube, x.com, Instagram, TikTok, "
+                "LinkedIn, Apple Podcasts, flux RSS, lien direct .mp3/.mp4…"
+            ),
         ],
         ctx: Context,
         video_index: Annotated[
             int,
-            Field(description="Index de la vidéo si le post en contient plusieurs (0 = la première).", ge=0, le=50),
+            Field(
+                description="Index de l'élément quand l'URL en contient plusieurs : post à plusieurs vidéos, "
+                "carrousel, playlist, flux RSS de podcast (0 = le premier, ou l'épisode le plus récent d'un flux).",
+                ge=0,
+                le=49,
+            ),
         ] = 0,
         language: Annotated[
             str | None,
             Field(
-                description="Code langue ISO-639-1 de la vidéo (ex. 'fr', 'en') pour forcer la langue. "
+                description="Code langue ISO-639-1 du média (ex. 'fr', 'en') pour forcer la langue. "
                 "Laisser vide pour la détection automatique."
             ),
         ] = None,
@@ -148,14 +163,16 @@ def main() -> None:
     setup_logging(settings.log_level)
     app, _, _ = create_app(settings)
     log.info(
-        "Démarrage : port %d | modèle %s (fournisseurs : ordre=%s ignorés=%s) | max %.0f min/vidéo | "
-        "%d transcriptions/h | cookies %s",
+        "Démarrage : port %d | modèle %s (fournisseurs : ordre=%s ignorés=%s) | max %.0f min/média | "
+        "%d transcriptions/h | sites %s | liens directs %s | cookies %s",
         settings.port,
         settings.transcription_model,
         ",".join(settings.provider_order) or "auto",
         ",".join(settings.provider_ignore) or "aucun",
         settings.max_video_minutes,
         settings.rate_limit_per_hour,
+        ",".join(settings.allowed_sites) or "tous (yt-dlp)",
+        "oui" if settings.allow_generic else "non",
         settings.cookies_path if settings.cookies_path and settings.cookies_path.is_file() else "non",
     )
     log.info("Endpoint MCP : http://<hôte>:%d/mcp/<MCP_AUTH_TOKEN>  (ou /mcp + Authorization: Bearer)", settings.port)

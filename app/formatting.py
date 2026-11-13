@@ -8,6 +8,26 @@ from typing import Any
 from .downloader import format_duration
 from .transcriber import TranscriptResult
 
+DESCRIPTION_MAX_CHARS = 1500
+
+PLATFORM_NAMES = {
+    "Twitter": "X (Twitter)",
+    "Youtube": "YouTube",
+    "YoutubeTab": "YouTube",
+    "TikTok": "TikTok",
+    "Instagram": "Instagram",
+    "LinkedIn": "LinkedIn",
+    "Facebook": "Facebook",
+    "Vimeo": "Vimeo",
+    "Soundcloud": "SoundCloud",
+    "ApplePodcasts": "Apple Podcasts",
+    "Dailymotion": "Dailymotion",
+    "Reddit": "Reddit",
+    "TwitchVod": "Twitch",
+    "ArchiveOrg": "Internet Archive",
+    "Generic": "lien direct / page web",
+}
+
 
 def _ts(seconds: float) -> str:
     total = int(seconds)
@@ -20,25 +40,54 @@ def _num(n: int | None) -> str | None:
     return None if n is None else f"{n:,}".replace(",", " ")
 
 
-def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int | None = None) -> str:
-    lines: list[str] = []
-    author = meta.get("author_name") or "?"
-    handle = meta.get("author_handle")
-    lines.append(f"# Transcript de la vidéo d'un post X de {author}" + (f" (@{handle})" if handle else ""))
-    lines.append("")
-    lines.append("## Post")
-    lines.append(f"- URL : {meta.get('url')}")
-    lines.append(f"- Auteur : {author}" + (f" (@{handle})" if handle else ""))
+def _date(meta: dict[str, Any]) -> str | None:
     if meta.get("timestamp"):
-        date = datetime.fromtimestamp(float(meta["timestamp"]), tz=UTC)
-        lines.append(f"- Date : {date:%Y-%m-%d %H:%M} UTC")
+        return f"{datetime.fromtimestamp(float(meta['timestamp']), tz=UTC):%Y-%m-%d %H:%M} UTC"
+    d = meta.get("upload_date")
+    if d and len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return None
+
+
+def _author(meta: dict[str, Any]) -> str | None:
+    name, ident = meta.get("author"), meta.get("author_id")
+    if ident and meta.get("platform") in ("Twitter", "TikTok", "Instagram") and not ident.startswith("@"):
+        ident = "@" + ident
+    if ident and (ident == name or ident.isdigit() or ident.startswith("UC") and len(ident) == 24):
+        ident = None  # identifiants techniques sans intérêt
+    if name and ident:
+        return f"{name} ({ident})"
+    return name or ident
+
+
+def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int | None = None) -> str:
+    platform = meta.get("platform") or "?"
+    platform_name = PLATFORM_NAMES.get(platform, platform)
+    is_x = platform == "Twitter"
+    author = _author(meta)
+    title = None if is_x else (meta.get("title") or "").strip() or None
+
+    heading = f"# Transcript — {title or ('post X de ' + author if is_x and author else 'média')}"
+    if author and not is_x:
+        heading += f" ({author})"
+    lines: list[str] = [heading, "", "## Source"]
+    lines.append(f"- Plateforme : {platform_name}")
+    lines.append(f"- URL : {meta.get('url')}")
+    if title:
+        lines.append(f"- Titre : {title}")
+    if author:
+        lines.append(f"- Auteur / chaîne : {author}")
+    if date := _date(meta):
+        lines.append(f"- Date : {date}")
+    if meta.get("playlist_title"):
+        lines.append(f"- Playlist / flux : {meta['playlist_title']}")
 
     stats = [
         (label, _num(meta.get(key)))
         for label, key in (
             ("likes", "like_count"),
             ("reposts", "repost_count"),
-            ("réponses", "comment_count"),
+            ("commentaires", "comment_count"),
             ("vues", "view_count"),
         )
     ]
@@ -46,29 +95,32 @@ def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int
     if stats_txt:
         lines.append(f"- Engagement : {stats_txt}")
 
-    text = (meta.get("text") or "").strip()
-    lines.append("- Texte du post :")
+    text = (meta.get("description") or "").strip()
     if text:
-        lines.extend(f"  > {line}" if line else "  >" for line in text.splitlines())
-    else:
-        lines.append("  (aucun texte)")
+        if len(text) > DESCRIPTION_MAX_CHARS:
+            text = text[:DESCRIPTION_MAX_CHARS].rstrip() + " […]"
+        lines.append("- Texte du post :" if is_x else "- Description :")
+        lines.extend(f"  > {line}" if line.strip() else "  >" for line in text.splitlines())
+    elif is_x:
+        lines.append("- Texte du post : (aucun texte)")
 
     lines.append("")
-    lines.append("## Vidéo")
-    count = meta.get("video_count") or 1
+    lines.append("## Média")
+    count = meta.get("item_count") or 1
     if count > 1:
-        idx = meta.get("video_index", 0)
-        lines.append(f"- Vidéo : {idx + 1}e sur {count} dans le post (video_index={idx} ; valeurs possibles 0 à {count - 1})")
+        idx = meta.get("item_index", 0)
+        last = min(count, 50) - 1
+        lines.append(f"- Élément : {idx + 1}e sur {count} (video_index={idx} ; valeurs possibles 0 à {last})")
     lines.append(f"- Durée : {format_duration(meta.get('duration') or transcript.duration)}")
     lines.append(f"- Langue : {transcript.language or 'inconnue'}")
     lines.append(f"- Modèle de transcription : {transcript.model}")
     if cached_at:
         when = datetime.fromtimestamp(cached_at, tz=UTC)
-        lines.append(f"- Source : cache (transcrit le {when:%Y-%m-%d %H:%M} UTC)")
+        lines.append(f"- Source du transcript : cache (transcrit le {when:%Y-%m-%d %H:%M} UTC)")
 
     lines.append("")
     if transcript.timestamps and transcript.segments:
-        lines.append("## Transcript (horodaté par segment, [mm:ss])")
+        lines.append("## Transcript (horodaté par segment)")
         lines.append("")
         lines.extend(f"[{_ts(s.start)}] {s.text}" for s in transcript.segments)
     elif transcript.segments:
@@ -85,5 +137,5 @@ def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int
 
     if not (transcript.text or "").strip():
         lines.append("")
-        lines.append("Note : aucune parole n'a été détectée (musique seule, silence ou vidéo sans voix).")
+        lines.append("Note : aucune parole n'a été détectée (musique seule, silence ou média sans voix).")
     return "\n".join(lines).rstrip() + "\n"

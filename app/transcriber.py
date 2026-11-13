@@ -20,7 +20,7 @@ from .errors import TranscriptionError
 log = logging.getLogger(__name__)
 
 PRICING_TTL = 24 * 3600
-MAX_PARALLEL_CHUNKS = 3
+MAX_PARALLEL_CHUNKS = 4
 
 
 @dataclass
