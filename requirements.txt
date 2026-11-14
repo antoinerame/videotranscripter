@@ -7,3 +7,6 @@ python-dotenv>=1.0
 # yt-dlp est aussi mis à jour au démarrage du conteneur (voir entrypoint.sh).
 # L'extra "deno" fournit le moteur JavaScript dont yt-dlp a besoin pour YouTube.
 yt-dlp[default,deno]>=2026.10.26
+# images : posts photo (gallery-dl, l'équivalent de yt-dlp pour les images) et optimisation JPEG
+gallery-dl>=1.32
+pillow>=11.0

@@ -1,16 +1,29 @@
-# video-transcript-mcp
+# media-content-mcp
 
 Serveur MCP distant, auto-hébergé, qui permet à Claude (claude.ai, en connecteur personnalisé)
-de récupérer le **transcript de n'importe quelle vidéo ou audio en ligne** :
-YouTube, X/Twitter, Instagram, TikTok, LinkedIn, Facebook, Vimeo, Dailymotion, Twitch, SoundCloud,
-Apple Podcasts, flux RSS de podcast, liens directs `.mp3` / `.mp4`… bref, tout ce que gère [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+de récupérer le **contenu de n'importe quelle vidéo, audio ou post en ligne** :
 
-Pipeline : URL → contrôles de sécurité → cache SQLite → yt-dlp (métadonnées + audio) → ffmpeg
-(mp3 mono 16 kHz, 32 kb/s) → découpage → OpenRouter `/api/v1/audio/transcriptions` → cache.
+- le **transcript** horodaté de la parole ;
+- sur demande, des **images clés** de la vidéo, horodatées pour les relier au transcript ;
+- les **images des posts sans vidéo** (photos, carrousels) ;
+- les **métadonnées** (auteur, date, texte, engagement).
+
+Sources : YouTube, X/Twitter, Instagram, TikTok, LinkedIn, Facebook, Bluesky, Vimeo, Dailymotion, Twitch,
+SoundCloud, Apple Podcasts, flux RSS de podcast, liens directs `.mp3` / `.mp4` / `.jpg`… Bref, tout ce
+que gèrent [yt-dlp](https://github.com/yt-dlp/yt-dlp) (vidéo/audio) et
+[gallery-dl](https://github.com/mikf/gallery-dl) (images).
+
+Pipeline : URL → contrôles de sécurité → cache SQLite → yt-dlp (métadonnées), puis selon le cas :
+- **vidéo / audio** : téléchargement → [images clés ffmpeg] → mp3 mono 16 kHz → découpage → OpenRouter
+  `/api/v1/audio/transcriptions` ;
+- **pas de vidéo** : gallery-dl → images du post ;
+
+puis optimisation JPEG (Pillow) → cache.
 
 - Transport MCP **streamable HTTP**, SDK officiel `mcp` v2 (où `FastMCP` s'appelle désormais `MCPServer`).
 - Écoute en HTTP simple sur `PORT` : le HTTPS est géré par votre reverse proxy.
-- Un outil : `get_video_transcript(url, video_index=0, language=None)`.
+- Un outil : `get_media_content(url, video_index=0, language=None, include_frames=False, max_frames=6)`.
+  Il renvoie un mélange de blocs texte et de blocs image MCP (`ImageContent`, JPEG en base64).
 
 ## Installation
 
@@ -30,10 +43,10 @@ Vérification : `curl http://127.0.0.1:8000/health` → `{"status": "ok"}`.
 Par défaut le port est publié sur `127.0.0.1` uniquement. Si votre reverse proxy tourne
 sur une autre machine, mettez `BIND_ADDRESS=0.0.0.0` dans `.env`.
 
-**Mise à jour depuis la version « X uniquement »** : `git pull && docker compose up -d --build`.
-Le cache existant est repris automatiquement. Dans claude.ai, l'outil `get_x_transcript` est remplacé
-par `get_video_transcript` : ouvrez une nouvelle conversation, ou déconnectez puis reconnectez le
-connecteur, pour que Claude voie le nouvel outil.
+**Mise à jour d'une installation existante** : `git pull && docker compose up -d --build`.
+Le cache existant est repris automatiquement. L'outil s'appelle maintenant `get_media_content`
+(ex-`get_video_transcript`, ex-`get_x_transcript`). Dans claude.ai, ouvrez une nouvelle conversation,
+ou déconnectez puis reconnectez le connecteur, pour que Claude voie le nouvel outil.
 
 ## Ajouter le connecteur dans claude.ai
 
@@ -46,8 +59,12 @@ Dans claude.ai : **Paramètres → Connecteurs → Ajouter un connecteur personn
 Le token se trouve dans le chemin parce que claude.ai ne permet pas d'ajouter un header.
 Pour d'autres clients MCP, le serveur accepte aussi `POST /mcp` avec `Authorization: Bearer <token>`.
 
-Ensuite, dans une conversation : *« Résume cette vidéo : https://youtu.be/… »*,
-*« Que dit-il dans ce post ? https://x.com/… »*, *« Transcris le dernier épisode de ce podcast : <flux RSS> »*.
+Ensuite, dans une conversation :
+- *« Résume cette vidéo : https://youtu.be/… »*
+- *« Que dit-il dans ce post ? https://x.com/… »*
+- *« Que montre le graphique dans cette vidéo ? »* : Claude passe alors `include_frames=true`.
+- *« Décris les photos de ce carrousel Instagram »*
+- *« Transcris le dernier épisode de ce podcast : <flux RSS> »*
 
 ## Reverse proxy
 
@@ -77,6 +94,8 @@ Ensuite, dans une conversation : *« Résume cette vidéo : https://youtu.be/…
 | `RATE_LIMIT_PER_HOUR` | `30` | Transcriptions par heure glissante (les hits de cache ne comptent pas) |
 | `COOKIES_PATH` | vide | ex. `/cookies/cookies.txt` (voir plus bas) |
 | `ALLOWED_SITES` | vide (= tous) | Restreint aux sites listés : noms d'extracteurs yt-dlp, ex. `youtube,twitter,instagram,tiktok,linkedin,apple:podcasts` |
+| `MAX_POST_IMAGES` | `20` | Images max renvoyées pour un post photo / carrousel |
+| `MAX_IMAGES_TOTAL_MB` | `5` | Budget total des images d'une réponse. Au-delà, réencodage en 1024, puis 768, puis 512 px |
 | `ALLOW_GENERIC` | `true` | Liens directs (mp3/mp4), flux RSS, pages web avec vidéo intégrée. `false` = uniquement les sites que yt-dlp connaît explicitement |
 | `TRANSCRIPTION_PROVIDER_ORDER` | `primeintellect` | Fournisseurs OpenRouter préférés, séparés par des virgules (repli automatique sur les autres). `none` = choix d'OpenRouter |
 | `TRANSCRIPTION_PROVIDER_IGNORE` | vide | Fournisseurs à exclure, ex. `deepinfra` |
@@ -86,7 +105,8 @@ Variables avancées (voir `.env.example`) : `BIND_ADDRESS`, `ALLOWED_HOSTS`, `MA
 
 ## Cookies (contenus qui exigent une connexion, ou site qui bloque)
 
-Instagram, LinkedIn, Facebook, certains posts X, les vidéos YouTube avec restriction d'âge, etc.
+Instagram (vidéos comme photos), LinkedIn, Facebook, certains posts X, les vidéos YouTube avec
+restriction d'âge, etc.
 demandent souvent d'être connecté. YouTube peut aussi afficher « confirm you're not a bot ».
 Pour ces cas :
 
@@ -103,6 +123,45 @@ Utilisez de préférence des comptes secondaires. Pour YouTube, le
 [wiki yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) recommande
 d'exporter depuis une fenêtre de navigation privée, pour que les cookies ne soient pas renouvelés.
 
+## Images
+
+**Posts sans vidéo** (photos seules, carrousel Instagram, post Bluesky, album imgur, lien `.jpg`…) :
+l'outil n'échoue plus. Il renvoie les métadonnées du post, puis chaque image précédée d'un bloc texte
+« Image i/N (largeur×hauteur) ». yt-dlp ignore les photos ; elles sont donc récupérées avec
+**gallery-dl**, qui utilise le même fichier de cookies. Les métadonnées viennent de yt-dlp quand il les
+fournit (texte, likes…), sinon de gallery-dl. Aucun quota de transcription n'est consommé.
+Un carrousel qui mélange photos et vidéos est traité comme une vidéo : `video_index` choisit la vidéo.
+
+**Images clés** (`include_frames=true`, `max_frames` 1 à 12, 6 par défaut) :
+- La vidéo est téléchargée en ≤ 1280 px de côté (1280×720 en paysage, 720×1280 en vertical),
+  au lieu de l'audio seul.
+- ffmpeg détecte les changements de scène (`select='gt(scene,0.3)'`, calculé sur une version
+  réduite pour aller vite : environ 15 s pour 10 min de vidéo).
+- La vidéo est découpée en tranches égales :
+  - la 1re est représentée par le début de la vidéo (souvent un titre ou une slide de couverture) ;
+  - chacune des autres par son changement de scène le plus marqué ;
+  - une tranche sans changement détecté par un **échantillon régulier** (repli quand la détection
+    est trop pauvre, par exemple pour une personne face caméra).
+- Une image quasi unie (écran noir, fondu) est remplacée par une image prise quelques secondes plus loin.
+- Au plus une image toutes les 2 s : une vidéo de 6 s donne 3 images.
+- Chaque image est précédée d'un bloc texte `[mm:ss] Image clé i/N (changement de scène)`, à relier
+  aux timestamps du transcript.
+- Pour un média audio seul (podcast), une note l'indique au lieu des images.
+- Si le transcript est déjà en cache, seules les images sont calculées. Aucun quota de transcription
+  n'est consommé.
+
+**Optimisation** : chaque image est convertie en JPEG qualité 80 progressif, côté le plus long
+≤ 1280 px. L'orientation EXIF est appliquée, la transparence passe sur fond blanc et seule la première
+image d'un GIF animé est gardée. En pratique, 6 images clés font 70 à 500 Ko. Si une réponse dépasse
+`MAX_IMAGES_TOTAL_MB`, ses images sont réencodées plus petites.
+
+**Cache** : images des posts (clé `post`) et images clés (clé `frames-<max_frames>`), stockées en JPEG
+optimisé dans `./data/cache.sqlite3`, avec les mêmes clés que les transcripts.
+
+> Taille des réponses : le client MCP Python limite par défaut un événement SSE à 1 Mio, et le script de
+> test lève cette limite. La limite côté claude.ai n'est pas documentée. Si des réponses avec images
+> n'arrivent pas, baissez `MAX_IMAGES_TOTAL_MB` (par ex. à 1).
+
 ## Sécurité
 
 - **Auth** : token obligatoire, dans le chemin ou en header `Bearer`, comparé en temps constant.
@@ -113,6 +172,8 @@ d'exporter depuis une fenêtre de navigation privée, pour que les cookies ne so
   sont contrôlés de la même façon. Limite connue : les redirections et requêtes internes faites par yt-dlp
   lui-même ne sont pas filtrées. `ALLOW_GENERIC=false` réduit encore la surface, au prix des liens directs
   et des flux RSS.
+- **Images** : chaque URL d'image renvoyée par gallery-dl est soumise au même contrôle d'IP publique.
+  Taille maximale de 25 Mo par image et protection de Pillow contre les « decompression bombs ».
 - **Fichiers** : ffmpeg ne lit que des fichiers locaux (`-protocol_whitelist file`). Les fichiers de type
   playlist (HLS, concat…) sont refusés avant conversion.
 - **Coûts** : durée maximale par média, rate limit par heure, et cache pour éviter les retranscriptions.
@@ -131,7 +192,12 @@ pip install -r requirements.txt
 python scripts/test_transcript.py "https://x.com/compte/status/123" --language fr
 ```
 
-Options : `--video-index N`, `--language xx`, `--bearer` (token en header plutôt que dans le chemin).
+Options :
+- `--video-index N` et `--language xx` ;
+- `--frames [--max-frames 6]` pour demander les images clés ;
+- `--save-images DOSSIER` (par défaut `data/test-images/`) : les images reçues y sont enregistrées
+  pour être regardées ;
+- `--bearer` : token en header plutôt que dans le chemin.
 Tests unitaires : `pip install pytest && pytest tests`.
 
 ## Comportement
@@ -186,10 +252,11 @@ video_transcript: ArchiveOrg:MLKDream lang=auto -> OK | durée 16:28 | 2 morceau
 
 ```
 app/
-  server.py       MCPServer + outil get_video_transcript + app ASGI (uvicorn)
+  server.py       MCPServer + outil get_media_content + app ASGI (uvicorn)
   auth.py         auth par token (chemin ou Bearer), comparaison en temps constant, logs sans token
   urls.py         validation des URLs : IP publiques, extracteurs autorisés, clé de cache hors ligne
-  service.py      pipeline, cache à deux niveaux, rate limit, concurrence
+  service.py      pipeline (vidéo / post photo), cache à deux niveaux, rate limit, concurrence
+  images.py       gallery-dl (posts photo), images clés ffmpeg, optimisation JPEG Pillow
   downloader.py   yt-dlp (métadonnées, playlists/flux, audio) + ffmpeg (conversion, découpage)
   transcriber.py  appels OpenRouter (SDK OpenAI), routage fournisseur, repli json, fusion, coût
   formatting.py   texte structuré renvoyé à Claude

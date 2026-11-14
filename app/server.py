@@ -1,4 +1,4 @@
-"""Serveur MCP distant (streamable HTTP) exposant l'outil get_video_transcript."""
+"""Serveur MCP distant (streamable HTTP) exposant l'outil get_media_content."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
@@ -21,37 +21,44 @@ from .service import TranscriptService
 log = logging.getLogger("video_transcript")
 
 INSTRUCTIONS = (
-    "Ce serveur récupère le transcript (texte parlé) de vidéos et d'audios en ligne : YouTube, X/Twitter, "
-    "Instagram, TikTok, LinkedIn, Facebook, Vimeo, SoundCloud, podcasts (Apple Podcasts, flux RSS, lien mp3 "
-    "direct) et la plupart des sites pris en charge par yt-dlp. Appelez get_video_transcript avec le lien. "
+    "Ce serveur récupère le contenu de vidéos, d'audios et de posts en ligne : transcript (texte parlé), "
+    "images clés des vidéos, images des posts photo, et métadonnées. Sources : YouTube, X/Twitter, Instagram, "
+    "TikTok, LinkedIn, Facebook, Bluesky, Vimeo, SoundCloud, podcasts (Apple Podcasts, flux RSS, lien mp3 direct) "
+    "et la plupart des sites pris en charge par yt-dlp / gallery-dl. Appelez get_media_content avec le lien. "
     "Les résultats sont mis en cache : rappeler l'outil sur le même lien est gratuit et instantané."
 )
 
-TOOL_DESCRIPTION = """Récupère le transcript (texte parlé) d'une vidéo ou d'un audio en ligne à partir de son URL.
+TOOL_DESCRIPTION = """Récupère le contenu d'une vidéo, d'un audio ou d'un post en ligne à partir de son URL.
 
-Sites pris en charge : YouTube (vidéos, shorts), X/Twitter, Instagram, TikTok, LinkedIn,
-Facebook, Vimeo, Dailymotion, Twitch (rediffusions), SoundCloud, Apple Podcasts, flux RSS
-de podcast, liens directs vers un fichier audio/vidéo, et la plupart des sites gérés par yt-dlp.
+- Vidéo / audio : transcript (texte parlé) horodaté par segment [mm:ss], plus, sur demande, des
+  images clés de la vidéo (chacune précédée de son timestamp [mm:ss] pour la relier au transcript).
+- Post sans vidéo (photos seules, carrousel Instagram…) : les images du post.
+- Dans tous les cas : plateforme, titre, auteur/chaîne, date, description ou texte du post,
+  engagement (likes, vues…), durée, langue détectée.
 
-Renvoie un texte structuré : plateforme, titre, auteur/chaîne, date, description ou texte
-du post, engagement (likes, vues…), durée, langue détectée, puis le transcript horodaté
-par segment [mm:ss] quand le modèle le permet.
+Sites : YouTube (vidéos, shorts), X/Twitter, Instagram, TikTok, LinkedIn, Facebook, Bluesky, Vimeo,
+Dailymotion, Twitch (rediffusions), SoundCloud, Apple Podcasts, flux RSS de podcast, liens directs
+vers un fichier audio/vidéo/image, et la plupart des sites gérés par yt-dlp / gallery-dl.
 
-À utiliser quand l'utilisateur partage un lien de vidéo, de post ou d'épisode de podcast
-et veut savoir ce qui s'y dit (résumé, citations, vérification…). Les directs en cours
-ne sont pas pris en charge, et la durée est plafonnée (30 min par défaut). Certains sites
-(Instagram, LinkedIn, contenus restreints) peuvent exiger que le serveur ait des cookies."""
+Mettre include_frames=true quand la vidéo contient probablement des graphiques, des slides ou du
+texte à l'écran, ou quand l'utilisateur parle d'un élément visuel. Sinon le laisser à false : les
+images coûtent du contexte et du temps de traitement.
+
+À utiliser quand l'utilisateur partage un lien de vidéo, de post ou d'épisode de podcast et veut
+savoir ce qui s'y dit ou s'y montre (résumé, citations, vérification…). Les directs en cours ne
+sont pas pris en charge et la durée est plafonnée (30 min par défaut). Certains sites (Instagram,
+LinkedIn, contenus restreints) peuvent exiger que le serveur ait des cookies."""
 
 
 def build_server(service: TranscriptService) -> MCPServer:
-    mcp = MCPServer("video-transcript", instructions=INSTRUCTIONS, version="2.0.0")
+    mcp = MCPServer("media-content", instructions=INSTRUCTIONS, version="3.0.0")
 
     @mcp.tool(
-        name="get_video_transcript",
-        title="Transcript d'une vidéo ou d'un audio",
+        name="get_media_content",
+        title="Contenu d'une vidéo, d'un audio ou d'un post",
         description=TOOL_DESCRIPTION,
         annotations=ToolAnnotations(
-            title="Transcript d'une vidéo ou d'un audio",
+            title="Contenu d'une vidéo, d'un audio ou d'un post",
             readOnlyHint=True,
             destructiveHint=False,
             idempotentHint=True,
@@ -59,12 +66,12 @@ def build_server(service: TranscriptService) -> MCPServer:
         ),
         structured_output=False,
     )
-    async def get_video_transcript(
+    async def get_media_content(
         url: Annotated[
             str,
             Field(
                 description="Lien de la vidéo, du post ou de l'épisode : YouTube, x.com, Instagram, TikTok, "
-                "LinkedIn, Apple Podcasts, flux RSS, lien direct .mp3/.mp4…"
+                "LinkedIn, Bluesky, Apple Podcasts, flux RSS, lien direct .mp3/.mp4/.jpg…"
             ),
         ],
         ctx: Context,
@@ -72,7 +79,7 @@ def build_server(service: TranscriptService) -> MCPServer:
             int,
             Field(
                 description="Index de l'élément quand l'URL en contient plusieurs : post à plusieurs vidéos, "
-                "carrousel, playlist, flux RSS de podcast (0 = le premier, ou l'épisode le plus récent d'un flux).",
+                "playlist, flux RSS de podcast (0 = le premier, ou l'épisode le plus récent d'un flux).",
                 ge=0,
                 le=49,
             ),
@@ -84,7 +91,19 @@ def build_server(service: TranscriptService) -> MCPServer:
                 "Laisser vide pour la détection automatique."
             ),
         ] = None,
-    ) -> str:
+        include_frames: Annotated[
+            bool,
+            Field(
+                description="Ajouter des images clés de la vidéo (changements de scène). Mettre true quand la "
+                "vidéo contient probablement des graphiques, des slides ou du texte à l'écran, ou quand "
+                "l'utilisateur parle d'un élément visuel."
+            ),
+        ] = False,
+        max_frames: Annotated[
+            int,
+            Field(description="Nombre maximum d'images clés si include_frames=true (1 à 12).", ge=1, le=12),
+        ] = 6,
+    ) -> list[str | Image]:
         async def progress(fraction: float, message: str) -> None:
             try:
                 await ctx.report_progress(fraction, 1.0, message)
@@ -92,7 +111,7 @@ def build_server(service: TranscriptService) -> MCPServer:
                 pass
 
         try:
-            return await service.get_transcript(url, video_index, language, progress)
+            return await service.get_content(url, video_index, language, include_frames, max_frames, progress)
         except TranscriptError as exc:
             raise ToolError(str(exc)) from exc
 

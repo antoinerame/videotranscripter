@@ -15,8 +15,16 @@ class NoMediaError(TranscriptError):
     """La page ne contient pas de vidéo/audio exploitable."""
 
 
+class NoVideoError(NoMediaError):
+    """La page existe mais yt-dlp n'y trouve ni vidéo ni audio (post photo ? -> repli sur les images)."""
+
+
 class MediaUnavailableError(TranscriptError):
     """Contenu supprimé, privé, introuvable ou géo-bloqué."""
+
+
+class UnsupportedUrlError(InvalidUrlError):
+    """yt-dlp ne sait pas extraire cette URL (peut-être une image ou une galerie -> repli sur les images)."""
 
 
 class LoginRequiredError(TranscriptError):

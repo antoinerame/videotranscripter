@@ -1,5 +1,8 @@
 """Cache SQLite des transcripts. Clé : (média, langue demandée).
 
+Les images (posts photo, images clés de vidéos) sont stockées en JPEG optimisé, dans les tables
+media_images / media_image_blobs, avec les mêmes clés.
+
 Le média est identifié par « plateforme:id » (ex. « Youtube:dQw4w9WgXcQ », « Twitter:1724883339285544960 »).
 On enregistre aussi un alias « requête » (ex. « Twitter:<id du post> ») quand l'URL désigne un média unique :
 un rappel sur la même URL est alors servi sans aucune requête réseau.
@@ -32,6 +35,29 @@ class TranscriptCache:
                 model       TEXT    NOT NULL,
                 payload     TEXT    NOT NULL,
                 PRIMARY KEY (media_key, language)
+            )
+            """
+        )
+        # images : posts photo (variant « post ») et images clés de vidéos (variant « frames-<n> »)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_images (
+                media_key   TEXT    NOT NULL,
+                variant     TEXT    NOT NULL,
+                created_at  INTEGER NOT NULL,
+                info        TEXT    NOT NULL,  -- JSON : {"meta": ..., "items": [{label, timestamp, width, height}]}
+                PRIMARY KEY (media_key, variant)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_image_blobs (
+                media_key   TEXT    NOT NULL,
+                variant     TEXT    NOT NULL,
+                idx         INTEGER NOT NULL,
+                jpeg        BLOB    NOT NULL,
+                PRIMARY KEY (media_key, variant, idx)
             )
             """
         )
@@ -87,6 +113,42 @@ class TranscriptCache:
                 "VALUES (?, ?, ?, ?, ?)",
                 [(k, language or AUTO, now, model, blob) for k in dict.fromkeys(keys)],
             )
+            self._conn.commit()
+
+    def get_images(self, key: str, variant: str) -> tuple[dict[str, Any], list[bytes]] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at, info FROM media_images WHERE media_key = ? AND variant = ?", (key, variant)
+            ).fetchone()
+            if not row:
+                return None
+            blobs = [
+                b
+                for (b,) in self._conn.execute(
+                    "SELECT jpeg FROM media_image_blobs WHERE media_key = ? AND variant = ? ORDER BY idx",
+                    (key, variant),
+                )
+            ]
+        info = json.loads(row[1])
+        info["cached_at"] = row[0]
+        if len(blobs) != len(info.get("items", [])):
+            return None  # entrée incomplète : on la refait
+        return info, blobs
+
+    def put_images(self, keys: list[str], variant: str, info: dict[str, Any], blobs: list[bytes]) -> None:
+        now = int(time.time())
+        blob_info = json.dumps(info)
+        with self._lock:
+            for key in dict.fromkeys(keys):
+                self._conn.execute("DELETE FROM media_image_blobs WHERE media_key = ? AND variant = ?", (key, variant))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO media_images (media_key, variant, created_at, info) VALUES (?, ?, ?, ?)",
+                    (key, variant, now, blob_info),
+                )
+                self._conn.executemany(
+                    "INSERT INTO media_image_blobs (media_key, variant, idx, jpeg) VALUES (?, ?, ?, ?)",
+                    [(key, variant, i, b) for i, b in enumerate(blobs)],
+                )
             self._conn.commit()
 
     @staticmethod

@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from mcp.server.mcpserver import Image
+
 from .downloader import format_duration
 from .transcriber import TranscriptResult
 
@@ -60,15 +62,16 @@ def _author(meta: dict[str, Any]) -> str | None:
     return name or ident
 
 
-def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int | None = None) -> str:
+def _source_lines(meta: dict[str, Any], *, kind: str) -> list[str]:
     platform = meta.get("platform") or "?"
     platform_name = PLATFORM_NAMES.get(platform, platform)
     is_x = platform == "Twitter"
     author = _author(meta)
     title = None if is_x else (meta.get("title") or "").strip() or None
 
-    heading = f"# Transcript — {title or ('post X de ' + author if is_x and author else 'média')}"
-    if author and not is_x:
+    fallback = f"post {platform_name} de {author}" if author else platform_name
+    heading = f"# {kind} — {title or fallback}"
+    if author and title:
         heading += f" ({author})"
     lines: list[str] = [heading, "", "## Source"]
     lines.append(f"- Plateforme : {platform_name}")
@@ -103,7 +106,11 @@ def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int
         lines.extend(f"  > {line}" if line.strip() else "  >" for line in text.splitlines())
     elif is_x:
         lines.append("- Texte du post : (aucun texte)")
+    return lines
 
+
+def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int | None = None) -> str:
+    lines = _source_lines(meta, kind="Transcript")
     lines.append("")
     lines.append("## Média")
     count = meta.get("item_count") or 1
@@ -139,3 +146,46 @@ def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int
         lines.append("")
         lines.append("Note : aucune parole n'a été détectée (musique seule, silence ou média sans voix).")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _cache_note(cached_at: int | None) -> str | None:
+    if not cached_at:
+        return None
+    return f"cache (préparé le {datetime.fromtimestamp(cached_at, tz=UTC):%Y-%m-%d %H:%M} UTC)"
+
+
+def render_post(meta: dict[str, Any], count: int, *, cached_at: int | None = None) -> str:
+    """En-tête d'un post sans vidéo : métadonnées, puis les images suivent en blocs séparés."""
+    lines = _source_lines(meta, kind="Post (images)")
+    lines += ["", f"## Images ({count})", ""]
+    lines.append(
+        "Ce post ne contient ni vidéo ni audio : voici ses images, dans l'ordre du post "
+        "(JPEG redimensionné, 1280 px max)."
+    )
+    if note := _cache_note(cached_at):
+        lines.append(f"Source des images : {note}.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def image_blocks(info: dict[str, Any], blobs: list[bytes], *, frames: bool) -> list[str | Image]:
+    """Un bloc texte (timestamp / numéro) juste avant chaque image."""
+    items = info.get("items", [])
+    blocks: list[str | Image] = []
+    if frames:
+        if not items:
+            return ["## Images clés\n\nAucune image : ce média n'a pas de piste vidéo (audio seul)."]
+        header = (
+            f"## Images clés ({len(items)})\n\n"
+            "Extraites par détection de changement de scène, complétées par un échantillonnage régulier si besoin. "
+            "Chaque image est précédée de son timestamp [mm:ss], à relier au transcript ci-dessus."
+        )
+        if note := _cache_note(info.get("cached_at")):
+            header += f"\nSource des images : {note}."
+        blocks.append(header)
+    for i, (item, jpeg) in enumerate(zip(items, blobs, strict=True), 1):
+        if frames:
+            blocks.append(f"[{_ts(item.get('timestamp') or 0.0)}] Image clé {i}/{len(items)} ({item.get('label')})")
+        else:
+            blocks.append(f"{item.get('label') or f'Image {i}/{len(items)}'} ({item.get('width')}×{item.get('height')})")
+        blocks.append(Image(data=jpeg, format="jpeg"))
+    return blocks

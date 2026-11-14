@@ -18,11 +18,12 @@ from yt_dlp.utils import ExtractorError
 
 from .errors import (
     DownloadError,
-    InvalidUrlError,
     LoginRequiredError,
     MediaUnavailableError,
     NoMediaError,
+    NoVideoError,
     SiteBlockedError,
+    UnsupportedUrlError,
 )
 from .urls import MediaRef, UrlPolicy, ensure_public_host, media_key
 
@@ -95,15 +96,25 @@ class _QuietLogger:
         log.info("yt-dlp error: %s", msg)
 
 
-def _ydl_opts(workdir: Path, cookies_path: Path | None, policy: UrlPolicy) -> dict[str, Any]:
+AUDIO_FORMAT = "bestaudio/worst"
+# images clés : vidéo dont les DEUX côtés font ≤ 1280 px (1280×720 en paysage, 720×1280 en vertical :
+# les images sont de toute façon réduites à 1280 px) + audio ; repli sur l'audio seul (podcasts)
+_FIT = "[height<=1280][width<=1280]"
+VIDEO_FORMAT = f"bv*{_FIT}+ba/b{_FIT}/bv*+ba/b/ba"
+
+
+def _ydl_opts(
+    workdir: Path, cookies_path: Path | None, policy: UrlPolicy, fmt: str = AUDIO_FORMAT
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": False,
         "noprogress": True,
         "logger": _QuietLogger(),
         "allowed_extractors": policy.allowed_extractors,
-        # piste audio seule si disponible, sinon le plus petit format vidéo+audio
-        "format": "bestaudio/worst",
+        # par défaut : piste audio seule si disponible, sinon le plus petit format vidéo+audio
+        "format": fmt,
+        "merge_output_format": "mkv",
         "outtmpl": str(workdir / "source.%(ext)s"),
         # watch?v=X&list=Y -> la vidéo X, pas la playlist
         "noplaylist": True,
@@ -147,7 +158,7 @@ def _map_ytdlp_error(exc: Exception, has_cookies: bool, site: str) -> Exception:
     cookies_bad = "Les cookies configurés sont peut-être expirés : ré-exportez-les." if has_cookies else COOKIES_HINT
 
     if "unsupported url" in low:
-        return InvalidUrlError(f"Site ou type de lien non pris en charge par yt-dlp : {msg[:200]}")
+        return UnsupportedUrlError(f"Aucune vidéo, aucun audio ni aucune image exploitable à cette adresse : {msg[:200]}")
     if _has(low, "drm"):
         return NoMediaError(f"Ce contenu ({site}) est protégé par DRM : impossible de récupérer l'audio.")
     if _has(low, "not a bot"):
@@ -167,7 +178,7 @@ def _map_ytdlp_error(exc: Exception, has_cookies: bool, site: str) -> Exception:
         low, "no video could be found", "no video formats", "is not a video", "no media found",
         "there is no video", "no formats found",
     ):  # fmt: skip
-        return NoMediaError(f"Aucune vidéo ni piste audio trouvée sur cette page ({site}).")
+        return NoVideoError(f"Aucune vidéo ni piste audio trouvée sur cette page ({site}).")
     if _has(low, "live event will begin", "premieres in", "not started yet"):
         return NoMediaError("Ce direct / cette première n'a pas encore commencé : rien à transcrire.")
     if _has(
@@ -234,8 +245,11 @@ def _media_info(ref: MediaRef, root: dict[str, Any], entry: dict[str, Any], coun
 
 def resolve_media(
     ref: MediaRef, index: int, workdir: Path, cookies_path: Path | None, policy: UrlPolicy
-) -> tuple[MediaInfo, dict[str, Any]]:
-    """Récupère les métadonnées du média visé (sans le télécharger). Bloquant."""
+) -> tuple[MediaInfo, dict[str, Any] | None]:
+    """Récupère les métadonnées du média visé (sans le télécharger). Bloquant.
+
+    Renvoie (métadonnées, entrée yt-dlp), ou (métadonnées, None) si la page existe mais sans vidéo ni audio.
+    """
     opts = _ydl_opts(workdir, cookies_path, policy)
     has_cookies = "cookiefile" in opts
     site = ref.extractor
@@ -249,7 +263,7 @@ def resolve_media(
             if info.get("_type") in ("playlist", "multi_video"):
                 entries = [e for e in (info.get("entries") or []) if e]
                 if not entries:
-                    raise NoMediaError(f"Cette page ({site}) ne contient aucune vidéo ni piste audio.")
+                    raise NoVideoError(f"Cette page ({site}) ne contient aucune vidéo ni piste audio.")
             else:
                 entries = [info]
 
@@ -287,9 +301,8 @@ def resolve_media(
                         f"Contenu introuvable sur {site} : supprimé, privé, URL erronée, ou le site refuse l'accès "
                         "anonyme. " + ("Les cookies configurés sont peut-être expirés." if has_cookies else COOKIES_HINT)
                     )
-                raise NoMediaError(
-                    f"Cette page ({site}) ne contient pas de vidéo ni d'audio (ou uniquement du texte / des images)."
-                )
+                # la page existe mais sans vidéo : peut-être un post photo (géré par l'appelant)
+                return _media_info(ref, info, meta_entry, len(entries), index), None
 
             if entry.get("is_live") or entry.get("live_status") == "is_live":
                 raise NoMediaError("C'est un direct en cours : seules les vidéos terminées peuvent être transcrites.")
@@ -307,11 +320,16 @@ def resolve_media(
         raise _map_ytdlp_error(exc, has_cookies, site) from exc
 
 
-def download_audio(
-    ref: MediaRef, entry: dict[str, Any], workdir: Path, cookies_path: Path | None, policy: UrlPolicy
+def download_media(
+    ref: MediaRef,
+    entry: dict[str, Any],
+    workdir: Path,
+    cookies_path: Path | None,
+    policy: UrlPolicy,
+    with_video: bool = False,
 ) -> Path:
-    """Télécharge l'audio (ou le plus petit format vidéo) du média déjà résolu. Bloquant."""
-    opts = _ydl_opts(workdir, cookies_path, policy)
+    """Télécharge l'audio (ou la vidéo ≤ 720p si with_video) du média déjà résolu. Bloquant."""
+    opts = _ydl_opts(workdir, cookies_path, policy, VIDEO_FORMAT if with_video else AUDIO_FORMAT)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.process_ie_result(entry, download=True)

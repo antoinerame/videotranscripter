@@ -64,6 +64,12 @@ class Settings:
     provider_ignore: list[str] = field(default_factory=list)
     allowed_sites: list[str] = field(default_factory=list)  # vide = tous les sites connus de yt-dlp
     allow_generic: bool = True  # liens directs (mp3, mp4), flux RSS, pages avec vidéo intégrée
+    max_post_images: int = 20  # images max renvoyées pour un post photo / carrousel
+    max_images_mb: float = 5.0  # budget total des images d'une réponse (au-delà : réencodage plus petit)
+
+    @property
+    def max_images_bytes(self) -> int:
+        return int(self.max_images_mb * 1024 * 1024)
 
     @property
     def cache_db_path(self) -> Path:
@@ -148,6 +154,8 @@ def load_settings(*, require_token: bool = True) -> Settings:
         provider_ignore=_env_list("TRANSCRIPTION_PROVIDER_IGNORE", ""),
         allowed_sites=_env_list("ALLOWED_SITES", ""),
         allow_generic=_env_bool("ALLOW_GENERIC", True),
+        max_post_images=max(1, _env_int("MAX_POST_IMAGES", 20)),
+        max_images_mb=max(0.5, _env_float("MAX_IMAGES_TOTAL_MB", 5.0)),
     )
     if settings.max_video_minutes <= 0:
         raise ConfigError("MAX_VIDEO_MINUTES doit être > 0.")

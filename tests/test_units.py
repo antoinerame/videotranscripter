@@ -206,3 +206,50 @@ def test_provider_routing_config():
     tr = OpenRouterTranscriber("k", "m", provider_order=["primeintellect"], provider_ignore=["deepinfra"])
     assert tr._provider == {"order": ["primeintellect"], "allow_fallbacks": True, "ignore": ["deepinfra"]}
     assert OpenRouterTranscriber("k", "m")._provider == {}
+
+
+def test_choose_timestamps_buckets():
+    from app.images import choose_timestamps
+
+    scenes = [(10.0, 0.4), (15.0, 0.9), (130.0, 0.5), (590.0, 0.6)]
+    out = choose_timestamps(600.0, scenes, 6)
+    assert len(out) == 6
+    assert out[0] == (0.5, "début")
+    # tranches de 100 s : 1 -> 130 (scène), 2, 3, 4 -> échantillons réguliers, 5 -> 590 (scène)
+    assert out[1] == (130.0, "changement de scène")
+    assert [label for _, label in out[2:5]] == ["échantillon régulier"] * 3
+    assert out[5] == (590.0, "changement de scène")
+    assert [t for t, _ in out] == sorted(t for t, _ in out)
+
+
+def test_choose_timestamps_short_video():
+    from app.images import choose_timestamps
+
+    assert len(choose_timestamps(5.0, [], 12)) == 2  # pas plus d'une image toutes les 2 s
+    assert choose_timestamps(0.0, [], 6) == [(0.0, "début")]
+
+
+def test_optimize_image_and_budget():
+    import io
+
+    from PIL import Image as PILImage
+
+    from app.images import ImageItem, fit_budget, optimize_image
+
+    src = io.BytesIO()
+    PILImage.effect_noise((3000, 2000), 80).convert("RGBA").save(src, "PNG")
+    jpeg, w, h = optimize_image(src.getvalue())
+    assert (w, h) == (1280, 853) and jpeg[:2] == b"\xff\xd8"
+    items = [ImageItem(jpeg, w, h, "x") for _ in range(4)]
+    small = fit_budget(items, [src.getvalue()] * 4, budget_bytes=len(jpeg) * 2)
+    assert sum(len(i.jpeg) for i in small) <= len(jpeg) * 2 and all(i.width < 1280 for i in small)
+
+
+def test_image_cache_roundtrip(tmp_path):
+    cache = TranscriptCache(tmp_path / "c.sqlite3")
+    info = {"meta": {"platform": "Twitter"}, "items": [{"label": "Image 1/2"}, {"label": "Image 2/2"}]}
+    cache.put_images(["Twitter:1", "Twitter:2"], "post", info, [b"a", b"b"])
+    got_info, blobs = cache.get_images("Twitter:2", "post")
+    assert blobs == [b"a", b"b"] and got_info["items"][1]["label"] == "Image 2/2" and got_info["cached_at"]
+    assert cache.get_images("Twitter:1", "frames-6") is None
+    cache.close()
