@@ -284,6 +284,11 @@ class TranscriptService:
         photos, photo_note = await self._post_photos(ref, progress)
 
         transcript = self.cache.get(meta.key, lang)
+        if transcript:
+            # Le cache est indexé par média : une même vidéo peut être reprise dans plusieurs posts (citation,
+            # repost). On garde le transcript mais on affiche (et on recopie sous la clé requête) les
+            # métadonnées du post demandé, pas celles du premier post qui a fait transcrire la vidéo.
+            transcript = {**transcript, "meta": meta.to_dict()}
         frames = self.cache.get_images(meta.key, variant) if include_frames else None
         need_transcript = transcript is None
         need_frames = include_frames and frames is None
