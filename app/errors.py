@@ -19,6 +19,10 @@ class NoVideoError(NoMediaError):
     """La page existe mais yt-dlp n'y trouve ni vidéo ni audio (post photo ? -> repli sur les images)."""
 
 
+class NoAudioError(NoMediaError):
+    """Vidéo sans piste audio (GIF, vidéo muette) : rien à transcrire, mais images/photos possibles."""
+
+
 class MediaUnavailableError(TranscriptError):
     """Contenu supprimé, privé, introuvable ou géo-bloqué."""
 

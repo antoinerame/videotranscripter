@@ -130,7 +130,25 @@ l'outil n'échoue plus. Il renvoie les métadonnées du post, puis chaque image 
 « Image i/N (largeur×hauteur) ». yt-dlp ignore les photos ; elles sont donc récupérées avec
 **gallery-dl**, qui utilise le même fichier de cookies. Les métadonnées viennent de yt-dlp quand il les
 fournit (texte, likes…), sinon de gallery-dl. Aucun quota de transcription n'est consommé.
-Un carrousel qui mélange photos et vidéos est traité comme une vidéo : `video_index` choisit la vidéo.
+**Posts mixtes** (carrousel Instagram, post X avec photos et vidéos…) : la réponse contient la vidéo
+demandée (transcript, plus images clés si demandées), **toutes les photos du post** et la structure
+complète du post. Par exemple :
+
+```
+## Contenu du post (3 éléments : 1 vidéo, 2 photos)
+1. vidéo — video_index=0, 0:25 ← cette réponse
+2. photo — Photo 1/2, ci-dessous
+3. photo — Photo 2/2, ci-dessous
+```
+
+Les autres vidéos sont listées avec leur `video_index` et leur durée. Elles ne sont pas transcrites
+d'office (coût, taille de la réponse) : Claude rappelle l'outil avec `video_index=1`, `2`… Les photos
+ne sont envoyées qu'avec `video_index=0`, pour ne pas les répéter à chaque vidéo. La structure du post
+vient de gallery-dl : un appel de plus vers le site, une seule fois par post, mis en cache même s'il
+n'y a aucune photo. Si cet appel échoue, la vidéo est quand même renvoyée, avec une note.
+
+**Vidéos muettes / GIF** : pas de transcript (rien à transcrire, aucun quota consommé), mais les
+métadonnées, les photos du post et, avec `include_frames=true`, les images clés sont renvoyées.
 
 **Images clés** (`include_frames=true`, `max_frames` 1 à 12, 6 par défaut) :
 - La vidéo est téléchargée en ≤ 1280 px de côté (1280×720 en paysage, 720×1280 en vertical),

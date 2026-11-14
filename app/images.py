@@ -86,6 +86,17 @@ def fit_budget(items: list[ImageItem], sources: list[bytes], budget_bytes: int) 
     return items
 
 
+def fit_blobs(groups: list[list[bytes]], budget_bytes: int) -> list[list[bytes]]:
+    """Budget appliqué à toute la réponse (photos du post + images clés) : réencode les JPEG plus petits si besoin."""
+    total = sum(len(b) for g in groups for b in g)
+    for max_side, quality in _FALLBACK_STEPS:
+        if total <= budget_bytes:
+            break
+        groups = [[optimize_image(b, max_side, quality)[0] for b in g] for g in groups]
+        total = sum(len(b) for g in groups for b in g)
+    return groups
+
+
 # --------------------------------------------------------------------------- posts photo (gallery-dl)
 
 _IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "jfif"}
@@ -162,16 +173,41 @@ def meta_from_gallery_dl(ref: MediaRef, kw: dict[str, Any], count: int) -> Media
     )
 
 
-def fetch_post_images(ref: MediaRef, max_images: int) -> tuple[list[ImageItem], list[bytes], dict[str, Any] | None]:
-    """Images d'un post via gallery-dl. Renvoie (images optimisées, originaux, métadonnées du 1er fichier). Bloquant."""
+@dataclass
+class PostMedia:
+    """Contenu d'un post vu par gallery-dl : photos téléchargées + structure complète (ordre, types)."""
+
+    items: list[ImageItem]
+    sources: list[bytes]
+    first_kw: dict[str, Any] | None
+    # un élément par média du post, dans l'ordre : {"kind": "photo"|"video"|"gif", "photo": n° de photo ou None}
+    layout: list[dict[str, Any]]
+
+
+_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm", "m3u8", "mkv"}
+
+
+def gallery_dl_supports(url: str) -> bool:
+    """gallery-dl a-t-il un extracteur pour cette URL ? (hors ligne)"""
+    from gallery_dl import extractor
+
+    try:
+        return extractor.find(url) is not None
+    except Exception:  # extracteur cassé : on considère que non
+        return False
+
+
+def fetch_post_media(ref: MediaRef, max_images: int) -> PostMedia:
+    """Photos et structure d'un post via gallery-dl. Bloquant."""
     from gallery_dl import exception, job
 
+    empty = PostMedia([], [], None, [])
     if not _gallery_dl_configured:
         configure_gallery_dl(None)
     try:
         data_job = job.DataJob(ref.url, file=None, resolve=1)
     except exception.NoExtractorError:
-        return [], [], None
+        return empty
     data_job.run()
     exc = data_job.exception
     if exc is not None and not data_job.data_urls:
@@ -181,18 +217,26 @@ def fetch_post_images(ref: MediaRef, max_images: int) -> tuple[list[ImageItem], 
             raise LoginRequiredError(
                 "Ce site exige d'être connecté pour voir les images de ce post : ajoutez ses cookies (COOKIES_PATH)."
             ) from exc
-        return [], [], None
+        return empty
+
+    # structure du post : chaque fichier, dans l'ordre, classé photo / vidéo / GIF
+    layout: list[dict[str, Any]] = []
+    photos: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for url, kw in zip(data_job.data_urls, data_job.data_meta, strict=False):
+        ext = str(kw.get("extension", "")).lower()
+        if url.startswith("ytdl:") or ext in _VIDEO_EXTENSIONS:
+            kind = "gif" if kw.get("type") == "animated_gif" else "video"
+            layout.append({"kind": kind, "photo": None})
+        elif ext in _IMAGE_EXTENSIONS:
+            entry = {"kind": "photo", "photo": None}
+            layout.append(entry)
+            photos.append((url, kw, entry))
 
     session = data_job.extractor.session
     items: list[ImageItem] = []
     sources: list[bytes] = []
-    first_kw = None
-    candidates = [
-        (url, kw)
-        for url, kw in zip(data_job.data_urls, data_job.data_meta, strict=False)
-        if not url.startswith("ytdl:") and str(kw.get("extension", "")).lower() in _IMAGE_EXTENSIONS
-    ]
-    for url, kw in candidates[:max_images]:
+    first_kw = data_job.data_meta[0] if data_job.data_meta else None
+    for url, _kw, entry in photos[:max_images]:
         try:
             ensure_public_host(url)
             raw = _download(session, url)
@@ -200,15 +244,18 @@ def fetch_post_images(ref: MediaRef, max_images: int) -> tuple[list[ImageItem], 
         except Exception as e:  # une image illisible ne doit pas faire échouer tout le post
             log.info("Image ignorée (%s) : %s", url[:120], e)
             continue
-        first_kw = first_kw or kw
         sources.append(raw)
         items.append(ImageItem(jpeg, w, h, label=""))
+        entry["photo"] = len(items)
+
+    mixed = len(photos) != len(layout)
     for i, item in enumerate(items, 1):
-        item.label = f"Image {i}/{len(items)}"
-    if len(candidates) > max_images:
-        log.info("Post avec %d images : seules les %d premières sont gardées (MAX_POST_IMAGES)",
-                 len(candidates), max_images)  # fmt: skip
-    return items, sources, first_kw
+        pos = next(n for n, e in enumerate(layout, 1) if e["photo"] == i)
+        item.label = f"Photo {i}/{len(items)} (élément {pos}/{len(layout)} du post)" if mixed else f"Image {i}/{len(items)}"
+    if len(photos) > max_images:
+        log.info("Post avec %d photos : seules les %d premières sont gardées (MAX_POST_IMAGES)",
+                 len(photos), max_images)  # fmt: skip
+    return PostMedia(items, sources, first_kw, layout)
 
 
 def _download(session: Any, url: str) -> bytes:

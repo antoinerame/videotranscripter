@@ -119,13 +119,18 @@ def render(meta: dict[str, Any], transcript: TranscriptResult, *, cached_at: int
         last = min(count, 50) - 1
         lines.append(f"- Élément : {idx + 1}e sur {count} (video_index={idx} ; valeurs possibles 0 à {last})")
     lines.append(f"- Durée : {format_duration(meta.get('duration') or transcript.duration)}")
-    lines.append(f"- Langue : {transcript.language or 'inconnue'}")
-    lines.append(f"- Modèle de transcription : {transcript.model}")
+    if not transcript.note:
+        lines.append(f"- Langue : {transcript.language or 'inconnue'}")
+    if not transcript.note:
+        lines.append(f"- Modèle de transcription : {transcript.model}")
     if cached_at:
         when = datetime.fromtimestamp(cached_at, tz=UTC)
         lines.append(f"- Source du transcript : cache (transcrit le {when:%Y-%m-%d %H:%M} UTC)")
 
     lines.append("")
+    if transcript.note:
+        lines += ["## Transcript", "", transcript.note]
+        return "\n".join(lines).rstrip() + "\n"
     if transcript.timestamps and transcript.segments:
         lines.append("## Transcript (horodaté par segment)")
         lines.append("")
@@ -189,3 +194,58 @@ def image_blocks(info: dict[str, Any], blobs: list[bytes], *, frames: bool) -> l
             blocks.append(f"{item.get('label') or f'Image {i}/{len(items)}'} ({item.get('width')}×{item.get('height')})")
         blocks.append(Image(data=jpeg, format="jpeg"))
     return blocks
+
+
+def render_post_layout(
+    meta: dict[str, Any], layout: list[dict[str, Any]], index: int, *, photos_sent: bool, photo_note: str | None
+) -> str | None:
+    """Structure d'un post mixte (photos + vidéos) ou multi-vidéos, pour que Claude sache tout ce qu'il contient."""
+    videos = meta.get("videos") or [{"index": 0, "duration": meta.get("duration")}]
+    n_videos = sum(1 for e in layout if e["kind"] != "photo")
+    n_photos = len(layout) - n_videos
+    if not layout:
+        if len(videos) <= 1:
+            return None if not photo_note else f"## Contenu du post\n\n{photo_note}\n"
+        layout = [{"kind": "video", "photo": None} for _ in videos]
+        n_videos = len(videos)
+    if n_photos == 0 and n_videos <= 1:
+        return None  # post à une seule vidéo : rien à signaler
+
+    def plural(n: int, word: str) -> str:
+        return f"{n} {word}{'s' if n > 1 else ''}"
+
+    parts = [plural(n_videos, "vidéo")] if n_videos else []
+    if n_photos:
+        parts.append(plural(n_photos, "photo"))
+    lines = [f"## Contenu du post ({plural(len(layout), 'élément')} : {', '.join(parts)})", ""]
+    k = 0
+    for pos, item in enumerate(layout, 1):
+        if item["kind"] == "photo":
+            if item.get("photo") and photos_sent:
+                lines.append(f"{pos}. photo — Photo {item['photo']}/{n_photos}, ci-dessous")
+            elif item.get("photo"):
+                lines.append(f"{pos}. photo — envoyée avec video_index=0")
+            else:
+                lines.append(f"{pos}. photo — non récupérée")
+            continue
+        info = videos[k] if k < len(videos) else {"index": k, "duration": None}
+        k += 1
+        dur = f", {format_duration(info.get('duration'))}" if info.get("duration") else ""
+        gif = " (GIF animé, sans son)" if item["kind"] == "gif" else ""
+        if info["index"] == index:
+            lines.append(f"{pos}. vidéo{gif} — video_index={info['index']}{dur} ← cette réponse")
+        else:
+            lines.append(
+                f"{pos}. vidéo{gif} — video_index={info['index']}{dur} : non transcrite ici, "
+                f"rappeler get_media_content avec video_index={info['index']}"
+            )
+    if photo_note:
+        lines += ["", photo_note]
+    return "\n".join(lines) + "\n"
+
+
+def photo_blocks(info: dict[str, Any], blobs: list[bytes]) -> list[str | Image]:
+    """Photos d'un post mixte (vidéo + photos), chacune précédée de sa position dans le post."""
+    if not blobs:
+        return []
+    return [f"## Photos du post ({len(blobs)})", *image_blocks(info, blobs, frames=False)]

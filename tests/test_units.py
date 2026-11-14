@@ -253,3 +253,26 @@ def test_image_cache_roundtrip(tmp_path):
     assert blobs == [b"a", b"b"] and got_info["items"][1]["label"] == "Image 2/2" and got_info["cached_at"]
     assert cache.get_images("Twitter:1", "frames-6") is None
     cache.close()
+
+
+def test_post_layout_mixed():
+    from app.formatting import render_post_layout
+
+    meta = {"videos": [{"index": 0, "duration": 25}, {"index": 1, "duration": 70}], "duration": 25}
+    layout = [{"kind": "photo", "photo": 1}, {"kind": "video", "photo": None},
+              {"kind": "photo", "photo": 2}, {"kind": "gif", "photo": None}]  # fmt: skip
+    txt = render_post_layout(meta, layout, 0, photos_sent=True, photo_note=None)
+    assert "4 éléments : 2 vidéos, 2 photos" in txt
+    assert "1. photo — Photo 1/2, ci-dessous" in txt
+    assert "2. vidéo — video_index=0, 0:25 ← cette réponse" in txt
+    assert "4. vidéo (GIF animé, sans son) — video_index=1, 1:10 : non transcrite ici" in txt
+    txt1 = render_post_layout(meta, layout, 1, photos_sent=False, photo_note=None)
+    assert "1. photo — envoyée avec video_index=0" in txt1 and "video_index=1, 1:10 ← cette réponse" in txt1
+
+
+def test_post_layout_single_video_is_silent():
+    from app.formatting import render_post_layout
+
+    assert render_post_layout({"duration": 10}, [{"kind": "video", "photo": None}], 0,
+                              photos_sent=False, photo_note=None) is None  # fmt: skip
+    assert render_post_layout({"duration": 10}, [], 0, photos_sent=False, photo_note=None) is None

@@ -34,6 +34,7 @@ from .downloader import (
 from .errors import (
     InvalidUrlError,
     MediaUnavailableError,
+    NoAudioError,
     NoMediaError,
     NoVideoError,
     RateLimitedError,
@@ -41,8 +42,16 @@ from .errors import (
     UnsupportedUrlError,
     VideoTooLongError,
 )
-from .formatting import image_blocks, render, render_post
-from .images import configure_gallery_dl, extract_frames, fetch_post_images, fit_budget, meta_from_gallery_dl
+from .formatting import image_blocks, photo_blocks, render, render_post, render_post_layout
+from .images import (
+    configure_gallery_dl,
+    extract_frames,
+    fetch_post_media,
+    fit_blobs,
+    fit_budget,
+    gallery_dl_supports,
+    meta_from_gallery_dl,
+)
 from .ratelimit import SlidingWindowRateLimiter
 from .transcriber import OpenRouterTranscriber, TranscriptResult
 from .urls import MediaRef, UrlPolicy, ensure_public_host
@@ -54,7 +63,9 @@ Content = list[str | Image]
 _LANG_RE = re.compile(r"^[a-z]{2,3}$")
 MAX_INDEX = 49
 MAX_FRAMES = 12
-POST = "post"
+POST = "post"  # post sans vidéo : métadonnées + images
+PHOTOS = "photos"  # photos (et structure) d'un post qui contient aussi des vidéos
+ImagesEntry = tuple[dict[str, Any], list[bytes]]
 
 
 async def _no_progress(_: float, __: str) -> None:
@@ -100,18 +111,33 @@ class TranscriptService:
 
     # ------------------------------------------------------------------ rendu
 
-    @staticmethod
     def _render_video(
-        transcript: dict[str, Any], frames: tuple[dict[str, Any], list[bytes]] | None
+        self,
+        transcript: dict[str, Any],
+        frames: ImagesEntry | None,
+        photos: ImagesEntry | None = None,
+        index: int = 0,
+        photo_note: str | None = None,
     ) -> Content:
-        text = render(
-            legacy_meta(transcript["meta"]),
-            TranscriptResult.from_dict(transcript["transcript"]),
-            cached_at=transcript.get("cached_at"),
+        meta = legacy_meta(transcript["meta"])
+        result = TranscriptResult.from_dict(transcript["transcript"])
+        text = render(meta, result, cached_at=transcript.get("cached_at"))
+        if result.note and frames is None:
+            text = text.rstrip() + "\nPour voir le contenu de la vidéo, rappeler l'outil avec include_frames=true.\n"
+        # les photos d'un post mixte ne sont envoyées qu'avec video_index=0 (pas à chaque vidéo)
+        photo_info, photo_blobs = photos if photos else ({}, [])
+        if index != 0:
+            photo_blobs = []
+        layout = render_post_layout(
+            meta, photo_info.get("layout", []), index, photos_sent=bool(photo_blobs), photo_note=photo_note
         )
-        content: Content = [text]
+        if layout:
+            text = text.rstrip() + "\n\n" + layout
+        frame_info, frame_blobs = frames if frames is not None else ({}, [])
+        photo_blobs, frame_blobs = fit_blobs([photo_blobs, frame_blobs], self.settings.max_images_bytes)
+        content: Content = [text, *photo_blocks(photo_info, photo_blobs)]
         if frames is not None:
-            content += image_blocks(frames[0], frames[1], frames=True)
+            content += image_blocks(frame_info, frame_blobs, frames=True)
         return content
 
     @staticmethod
@@ -154,10 +180,15 @@ class TranscriptService:
                     return self._render_post(*post)
                 transcript = self.cache.get(rk, lang)
                 frames = self.cache.get_images(rk, variant) if include_frames else None
-                if transcript and (frames or not include_frames):
+                photos = self.cache.get_images(rk, PHOTOS)
+                if (
+                    transcript
+                    and (frames or not include_frames)
+                    and (photos or not await asyncio.to_thread(gallery_dl_supports, ref.url))
+                ):
                     log.info("%s lang=%s frames=%s -> CACHE HIT (%.2fs)", rk, lang or "auto",
                              include_frames, time.monotonic() - t0)  # fmt: skip
-                    return self._render_video(transcript, frames)
+                    return self._render_video(transcript, frames, photos, index)
             async with self._jobs:
                 return await self._run_job(ref, index, lang, include_frames, max_frames, progress, t0)
 
@@ -208,7 +239,8 @@ class TranscriptService:
                 return self._render_post(*cached)
 
         await progress(0.3, "Pas de vidéo : récupération des images du post…")
-        items, sources, kw = await asyncio.to_thread(fetch_post_images, ref, self.settings.max_post_images)
+        post = await asyncio.to_thread(fetch_post_media, ref, self.settings.max_post_images)
+        items, sources, kw = post.items, post.sources, post.first_kw
         if not items:
             raise no_video or NoMediaError(
                 "Cette page ne contient ni vidéo, ni audio, ni image exploitable (ou uniquement du texte)."
@@ -248,6 +280,9 @@ class TranscriptService:
         single = meta.item_count == 1 and index == 0
         keys = [meta.key] + ([ref.request_key] if single and ref.request_key else [])
 
+        # photos du post (posts mixtes photo + vidéo) : une fois par post, non bloquant
+        photos, photo_note = await self._post_photos(ref, progress)
+
         transcript = self.cache.get(meta.key, lang)
         frames = self.cache.get_images(meta.key, variant) if include_frames else None
         need_transcript = transcript is None
@@ -256,7 +291,7 @@ class TranscriptService:
             self._alias(keys, lang, transcript, frames, variant)
             log.info("%s lang=%s -> CACHE HIT après métadonnées (%.2fs)", meta.key, lang or "auto",
                      time.monotonic() - t0)  # fmt: skip
-            return self._render_video(transcript, frames)
+            return self._render_video(transcript, frames, photos, index, photo_note)
 
         if meta.duration and meta.duration > s.max_video_seconds:
             raise VideoTooLongError(
@@ -303,7 +338,18 @@ class TranscriptService:
             if need_transcript:
                 await progress(0.4, "Conversion audio (mp3 mono 16 kHz)…")
                 audio = workdir / "audio.mp3"
-                await asyncio.to_thread(to_compact_mp3, source, audio, s.audio_bitrate)
+                try:
+                    await asyncio.to_thread(to_compact_mp3, source, audio, s.audio_bitrate)
+                except NoAudioError as exc:
+                    # vidéo muette / GIF : pas de transcript, mais métadonnées, photos et images clés restent utiles
+                    result = TranscriptResult(text="", duration=duration, model="", note=str(exc))
+                    transcript = {"meta": meta.to_dict(), "transcript": result.to_dict()}
+                    self.cache.put(keys, lang, "", transcript)
+                    self.limiter.refund()
+                    acquired = False
+                    log.info("%s -> vidéo sans piste audio : pas de transcription", meta.key)
+                    await progress(1.0, "Terminé")
+                    return self._render_video(transcript, frames, photos, index, photo_note)
                 source.unlink(missing_ok=True)
                 chunks = await asyncio.to_thread(
                     split_audio, audio, duration, s.max_upload_bytes, s.chunk_max_seconds, s.audio_bitrate
@@ -324,7 +370,30 @@ class TranscriptService:
             raise
 
         await progress(1.0, "Terminé")
-        return self._render_video(transcript, frames if include_frames else None)
+        return self._render_video(transcript, frames if include_frames else None, photos, index, photo_note)
+
+    async def _post_photos(self, ref: MediaRef, progress: ProgressFn) -> tuple[ImagesEntry | None, str | None]:
+        """Photos et structure du post via gallery-dl (si le site est pris en charge). Mis en cache par post."""
+        post_key = ref.request_key  # X : id du tweet ; Instagram : shortcode…
+        if not post_key or not await asyncio.to_thread(gallery_dl_supports, ref.url):
+            return None, None
+        if cached := self.cache.get_images(post_key, PHOTOS):
+            return cached, None
+        await progress(0.1, "Recherche d'éventuelles photos dans le post…")
+        try:
+            post = await asyncio.to_thread(fetch_post_media, ref, self.settings.max_post_images)
+        except TranscriptError as exc:  # la vidéo reste exploitable sans les photos
+            log.info("%s -> photos du post non récupérées : %s", post_key, exc)
+            return None, f"Photos éventuelles du post non récupérées : {exc}"
+        if not post.layout:
+            return None, None  # gallery-dl n'a rien vu (site qui bloque…) : on ne met pas en cache
+        items = fit_budget(post.items, post.sources, self.settings.max_images_bytes)
+        info = {"items": [i.header() for i in items], "layout": post.layout}
+        blobs = [i.jpeg for i in items]
+        self.cache.put_images([post_key], PHOTOS, info, blobs)  # mis en cache même sans photo
+        if items:
+            log.info("%s -> post mixte : %d photo(s) sur %d élément(s)", post_key, len(items), len(post.layout))
+        return (info, blobs), None
 
     def _frames(self, source: Path, duration: float, max_frames: int, workdir: Path):
         try:

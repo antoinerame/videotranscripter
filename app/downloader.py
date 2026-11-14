@@ -20,6 +20,7 @@ from .errors import (
     DownloadError,
     LoginRequiredError,
     MediaUnavailableError,
+    NoAudioError,
     NoMediaError,
     NoVideoError,
     SiteBlockedError,
@@ -64,6 +65,8 @@ class MediaInfo:
     item_index: int
     item_count: int
     playlist_title: str | None
+    # vidéos d'un post multi-vidéos (X, Instagram…) : [{"index": 0, "duration": 12.3}, …] ; None sinon
+    videos: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -315,6 +318,9 @@ def resolve_media(
             media = _media_info(ref, info, meta_entry, count, index)
             if key:
                 media.key = key
+            if len(entries) > 1 and all(e.get("_type") not in ("url", "url_transparent") for e in entries):
+                # post multi-vidéos (éléments déjà résolus) : pas une playlist ni un flux RSS
+                media.videos = [{"index": i, "duration": e.get("duration")} for i, e in enumerate(entries)]
             return media, entry
     except (YtDlpDownloadError, ExtractorError) as exc:
         raise _map_ytdlp_error(exc, has_cookies, site) from exc
@@ -383,7 +389,7 @@ def to_compact_mp3(src: Path, dst: Path, bitrate: str) -> None:
     if set(fmt.split(",")) & _FORBIDDEN_FFMPEG_FORMATS:
         raise DownloadError(f"Format de fichier inattendu ({fmt}) : conversion refusée.")
     if not has_audio:
-        raise NoMediaError("Ce média n'a pas de piste audio (GIF ou vidéo muette) : rien à transcrire.")
+        raise NoAudioError("Ce média n'a pas de piste audio (GIF ou vidéo muette) : rien à transcrire.")
     res = _run(
         [
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",

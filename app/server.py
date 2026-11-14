@@ -33,6 +33,9 @@ TOOL_DESCRIPTION = """Récupère le contenu d'une vidéo, d'un audio ou d'un pos
 - Vidéo / audio : transcript (texte parlé) horodaté par segment [mm:ss], plus, sur demande, des
   images clés de la vidéo (chacune précédée de son timestamp [mm:ss] pour la relier au transcript).
 - Post sans vidéo (photos seules, carrousel Instagram…) : les images du post.
+- Post mixte (photos + vidéos) : la vidéo demandée, toutes les photos du post (avec video_index=0)
+  et la liste de ses éléments ; rappeler avec video_index=1, 2… pour les autres vidéos.
+- Vidéo muette / GIF : pas de transcript, mais métadonnées, photos et images clés si demandées.
 - Dans tous les cas : plateforme, titre, auteur/chaîne, date, description ou texte du post,
   engagement (likes, vues…), durée, langue détectée.
 

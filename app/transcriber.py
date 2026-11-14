@@ -41,6 +41,7 @@ class TranscriptResult:
     estimated_cost: float | None = None  # usage.seconds × prix/seconde du modèle
     timestamps: bool = False
     model: str = ""
+    note: str | None = None  # ex. vidéo sans piste audio
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +54,7 @@ class TranscriptResult:
             "estimated_cost": self.estimated_cost,
             "timestamps": self.timestamps,
             "model": self.model,
+            "note": self.note,
         }
 
     @classmethod
@@ -67,6 +69,7 @@ class TranscriptResult:
             estimated_cost=d.get("estimated_cost"),
             timestamps=bool(d.get("timestamps")),
             model=d.get("model", ""),
+            note=d.get("note"),
         )
 
 
